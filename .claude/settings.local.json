@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__mcp-espressif-docs__search_espressif_sources",
+      "mcp__zread__get_repo_structure",
+      "WebSearch",
+      "WebFetch(domain:components.espressif.com)",
+      "mcp__zread__read_file",
+      "mcp__github__get_file_contents",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "mcp__github__search_code"
+    ]
+  }
+}
