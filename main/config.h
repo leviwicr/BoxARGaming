@@ -53,6 +53,37 @@ extern "C" {
 #define IMU_I2C_FREQ_HZ         400000  // 400kHz
 #define IMU_FILTER_ALPHA        0.98f   // 互补滤波系数
 
+/* ------------------------------ 图像预处理配置 ------------------------------ */
+#define PREPROC_FLAG_NONE        0
+#define PREPROC_FLAG_HIST_EQ     (1 << 0)   // 直方图均衡化
+#define PREPROC_FLAG_SHARPEN     (1 << 1)   // 锐化 (3x3 Laplacian)
+#define PREPROC_FLAG_CONTRAST    (1 << 2)   // 对比度拉伸 (2%-98% 百分位)
+#define PREPROC_FLAG_DENOISE     (1 << 3)   // 去噪 (3x3 中值滤波)
+#define PREPROC_FLAG_GAMMA       (1 << 4)   // Gamma 校正 (γ=1.8 暗区提亮)
+
+/* Gamma 校正值 (>1 提亮暗区, <1 压暗) */
+#define PREPROC_GAMMA_VALUE      1.8f
+
+/* 初始预处理模式 (运行时可通过按钮切换) */
+#define PREPROC_DEFAULT_FLAGS    PREPROC_FLAG_GAMMA
+
+/* 预处理预设模式 (按钮循环切换) */
+#define PREPROC_PRESET_COUNT     6
+#define PREPROC_PRESET_0         PREPROC_FLAG_NONE                                 /* OFF          */
+#define PREPROC_PRESET_1         PREPROC_FLAG_GAMMA                                /* Gamma        */
+#define PREPROC_PRESET_2         (PREPROC_FLAG_GAMMA | PREPROC_FLAG_DENOISE)       /* Gamma+DN     */
+#define PREPROC_PRESET_3         PREPROC_FLAG_DENOISE                              /* DN           */
+#define PREPROC_PRESET_4         (PREPROC_FLAG_HIST_EQ | PREPROC_FLAG_DENOISE)     /* HE+DN        */
+#define PREPROC_PRESET_5         (PREPROC_FLAG_GAMMA | PREPROC_FLAG_DENOISE |      \
+                                  PREPROC_FLAG_SHARPEN | PREPROC_FLAG_CONTRAST)     /* ALL */
+
+/* 预处理管线执行顺序: 去噪 → Gamma 校正 → 直方图均衡化 → 锐化 → 对比度拉伸 */
+
+/* ------------------------------ 相机 ISP 配置 ----------------------------- */
+#define CAMERA_AE_LEVEL         4       // AE 目标亮度偏移 (EV), 范围通常 -5~+5, 正值更亮
+#define CAMERA_ISP_GAMMA_ENABLE 1       // 是否启用 ISP 硬件 Gamma 校正
+#define CAMERA_ISP_GAMMA_VALUE  1.8f    // ISP Gamma 值 (>1 提亮暗区)
+
 #ifdef __cplusplus
 }
 #endif

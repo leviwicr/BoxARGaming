@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,25 @@ esp_err_t camera_warmup(int frames);
  * @return ESP_OK 成功, ESP_ERR_NOT_SUPPORTED=传感器不支持
  */
 esp_err_t camera_test_pattern(int enable);
+
+/**
+ * @brief 设置 AE 目标亮度偏移 (EV)
+ * @param level AE 级别偏移, 正值更亮, 范围通常 -5~+5
+ * @return ESP_OK 成功
+ */
+esp_err_t camera_set_ae_level(int level);
+
+/**
+ * @brief 配置 ISP 硬件 Gamma 校正曲线
+ *
+ * ISP 硬件直接对传感器输出的 RAW 数据做 Gamma 映射,
+ * 零 CPU 开销, 在 ESP-DL 预处理管线之前生效。
+ *
+ * @param enable 启用/禁用
+ * @param gamma  Gamma 值 (>1 提亮暗区, 典型 1.5~2.2)
+ * @return ESP_OK 成功
+ */
+esp_err_t camera_set_isp_gamma(bool enable, float gamma);
 
 #ifdef __cplusplus
 }

@@ -6,12 +6,16 @@
 
 #include <stdio.h>
 #include <list>
+#include <cstring>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "coco_detect.hpp"
 #include "dl_image_define.hpp"
+#include "dl_image_process.hpp"
 #include "config.h"
 #include "camera/camera_driver.h"
 #include "detection/detection_driver.h"
+#include "image_processing/image_processing.hpp"
 
 static const char *TAG = "detection";
 
@@ -72,7 +76,8 @@ esp_err_t detection_init(void)
 
 esp_err_t detection_run(const camera_frame_t *frame,
                         detection_result_t *results,
-                        int *count)
+                        int *count,
+                        uint32_t preprocess_flags)
 {
     if (!frame || !frame->buffer || !results || !count || *count <= 0) {
         return ESP_ERR_INVALID_ARG;
@@ -88,20 +93,76 @@ esp_err_t detection_run(const camera_frame_t *frame,
     img.data     = frame->buffer;
     img.width    = frame->width;
     img.height   = frame->height;
-    img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;//确认缓冲区的图像数据是RGB565大端还是小端！！
+    img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
+
+    /* 可选: 预处理管线 (RGB565 → RGB888 → preprocess → RGB565) */
+    dl::image::img_t proc_img = img;
+    bool preprocessed = false;
+
+    if (preprocess_flags != 0) {
+        uint8_t *temp_buf = preprocessing_get_temp_buffer();
+        if (!temp_buf) {
+            ESP_LOGW(TAG, "Preprocessing temp buffer not available, skipping");
+        } else {
+            /* 分配处理后的 RGB565 缓冲区 (与帧相同尺寸) */
+            size_t rgb565_size = frame->width * frame->height * 2;
+            uint8_t *proc_buf = (uint8_t *)heap_caps_calloc(1, rgb565_size,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!proc_buf) {
+                ESP_LOGW(TAG, "Failed to alloc preprocessing buffer, skipping");
+            } else {
+                ESP_LOGI(TAG, "Applying preprocessing flags=0x%02X", (unsigned)preprocess_flags);
+
+                /* Step 1: RGB565 → RGB888 (使用 ImageTransformer) */
+                dl::image::img_t src_rgb888;
+                src_rgb888.data     = temp_buf;
+                src_rgb888.width    = frame->width;
+                src_rgb888.height   = frame->height;
+                src_rgb888.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
+
+                dl::image::ImageTransformer()
+                    .set_src_img(img)
+                    .set_dst_img(src_rgb888)
+                    .transform();
+
+                /* Step 2: 预处理 (原地修改 RGB888) */
+                preprocess(src_rgb888, preprocess_flags);
+
+                /* Step 3: RGB888 → RGB565 (使用 ImageTransformer) */
+                dl::image::img_t dst_rgb565;
+                dst_rgb565.data     = proc_buf;
+                dst_rgb565.width    = frame->width;
+                dst_rgb565.height   = frame->height;
+                dst_rgb565.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
+
+                dl::image::ImageTransformer()
+                    .set_src_img(src_rgb888)
+                    .set_dst_img(dst_rgb565)
+                    .transform();
+
+                proc_img = dst_rgb565;
+                preprocessed = true;
+            }
+        }
+    }
 
     /* 运行检测 (预处理 + 推理 + 后处理 自动完成) */
     ESP_LOGI(TAG, "Running detection on %dx%d frame...",
-             frame->width, frame->height);
+             proc_img.width, proc_img.height);
 
-    /* 像素采样诊断: 打印前 16 个像素验证数据 */
+    /* 像素采样诊断: 打印前 8 个像素验证数据 */
     {
-        uint16_t *px = (uint16_t *)frame->buffer;
+        uint16_t *px = (uint16_t *)proc_img.data;
         ESP_LOGI(TAG, "Pixel[0..7]: %04X %04X %04X %04X %04X %04X %04X %04X",
                  px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7]);
     }
 
-    std::list<dl::detect::result_t> &detect_results = g_detect->run(img);
+    std::list<dl::detect::result_t> &detect_results = g_detect->run(proc_img);
+
+    /* 释放预处理缓冲区 */
+    if (preprocessed) {
+        heap_caps_free(proc_img.data);
+    }
 
     /* 诊断: 输出原始检测数量 */
     int raw_count = 0;
@@ -127,34 +188,46 @@ esp_err_t detection_run(const camera_frame_t *frame,
         /* 白名单过滤 */
         if (!is_desktop_object(res.category)) continue;
 
-        /* 转换坐标并裁剪到地图范围 */
-        int x1 = (int)(res.box[0] * scale_x);
-        int y1 = (int)(res.box[1] * scale_y);
-        int x2 = (int)(res.box[2] * scale_x);
-        int y2 = (int)(res.box[3] * scale_y);
+        /* 存储相机空间原始坐标 (裁剪到有效范围) */
+        int cx1 = res.box[0], cy1 = res.box[1];
+        int cx2 = res.box[2], cy2 = res.box[3];
+        if (cx1 < 0) cx1 = 0;
+        if (cy1 < 0) cy1 = 0;
+        if (cx2 >= CAMERA_H_RES) cx2 = CAMERA_H_RES - 1;
+        if (cy2 >= CAMERA_V_RES) cy2 = CAMERA_V_RES - 1;
+
+        /* 跳过无效框 */
+        if (cx2 <= cx1 || cy2 <= cy1) continue;
+
+        /* 转换为地图坐标 */
+        int x1 = (int)(cx1 * scale_x);
+        int y1 = (int)(cy1 * scale_y);
+        int x2 = (int)(cx2 * scale_x);
+        int y2 = (int)(cy2 * scale_y);
 
         if (x1 < 0) x1 = 0;
         if (y1 < 0) y1 = 0;
         if (x2 >= MAP_SIZE) x2 = MAP_SIZE - 1;
         if (y2 >= MAP_SIZE) y2 = MAP_SIZE - 1;
 
-        /* 跳过无效框 */
-        if (x2 <= x1 || y2 <= y1) continue;
-
-        results[result_idx].category = res.category;
-        results[result_idx].score    = res.score;
-        results[result_idx].box[0]   = x1;
-        results[result_idx].box[1]   = y1;
-        results[result_idx].box[2]   = x2;
-        results[result_idx].box[3]   = y2;
-        results[result_idx].label    = (res.category >= 0 && res.category < 80)
-                                       ? COCO_CLASSES[res.category] : "unknown";
+        results[result_idx].category      = res.category;
+        results[result_idx].score         = res.score;
+        results[result_idx].box[0]        = x1;
+        results[result_idx].box[1]        = y1;
+        results[result_idx].box[2]        = x2;
+        results[result_idx].box[3]        = y2;
+        results[result_idx].box_camera[0] = cx1;
+        results[result_idx].box_camera[1] = cy1;
+        results[result_idx].box_camera[2] = cx2;
+        results[result_idx].box_camera[3] = cy2;
+        results[result_idx].label         = (res.category >= 0 && res.category < 80)
+                                            ? COCO_CLASSES[res.category] : "unknown";
 
         ESP_LOGI(TAG, "[%d] %s score=%.2f box=[%d,%d,%d,%d] map=[%d,%d,%d,%d]",
                  result_idx,
                  results[result_idx].label,
                  results[result_idx].score,
-                 res.box[0], res.box[1], res.box[2], res.box[3],
+                 cx1, cy1, cx2, cy2,
                  x1, y1, x2, y2);
 
         result_idx++;

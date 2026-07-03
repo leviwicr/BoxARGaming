@@ -20,11 +20,13 @@
 #include "esp_err.h"
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
+#include "esp_video_isp_ioctl.h"
 #include "linux/videodev2.h"
 
 /* BSP — 获取已有 I2C 总线 */
 #include "bsp/esp-bsp.h"
 
+#include <math.h>
 #include "config.h"
 #include "camera/camera_driver.h"
 
@@ -172,18 +174,15 @@ esp_err_t camera_init(void)
         goto fail;
     }
 
-    /* 7. 传感器级亮度/增益控制 (尽力而为, 不影响 ISP IPA 管线) */
-    struct v4l2_control ctrl = {0};
-    ctrl.id = V4L2_CID_AUTOGAIN;
-    ctrl.value = 1;
-    if (ioctl(g_fd, VIDIOC_S_CTRL, &ctrl) != 0) {
-        ESP_LOGW(TAG, "V4L2_CID_AUTOGAIN not supported");
+    /* 7. 应用 ISP 配置 */
+    esp_err_t ae_ret = camera_set_ae_level(CAMERA_AE_LEVEL);
+    if (ae_ret != ESP_OK) {
+        ESP_LOGW(TAG, "AE level control not supported, continuing");
     }
 
-    ctrl.id = V4L2_CID_BRIGHTNESS;
-    ctrl.value = 128;
-    if (ioctl(g_fd, VIDIOC_S_CTRL, &ctrl) != 0) {
-        ESP_LOGW(TAG, "V4L2_CID_BRIGHTNESS not supported");
+    esp_err_t gamma_ret = camera_set_isp_gamma(CAMERA_ISP_GAMMA_ENABLE, CAMERA_ISP_GAMMA_VALUE);
+    if (gamma_ret != ESP_OK) {
+        ESP_LOGW(TAG, "ISP gamma control not supported, continuing");
     }
 
     ESP_LOGI(TAG, "=== Camera Init Complete (streaming) ===");
@@ -293,6 +292,72 @@ esp_err_t camera_test_pattern(int enable)
     }
 
     ESP_LOGI(TAG, "Sensor test pattern: %s", enable ? "ON" : "OFF");
+    return ESP_OK;
+}
+
+esp_err_t camera_set_ae_level(int level)
+{
+    if (g_fd < 0) {
+        ESP_LOGE(TAG, "Camera not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    struct v4l2_control ctrl = {
+        .id    = V4L2_CID_CAMERA_AE_LEVEL,
+        .value = level,
+    };
+
+    if (ioctl(g_fd, VIDIOC_S_CTRL, &ctrl) != 0) {
+        ESP_LOGW(TAG, "V4L2_CID_CAMERA_AE_LEVEL(%d) failed (errno=%d)", level, errno);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    ESP_LOGI(TAG, "AE level set to %d EV", level);
+    return ESP_OK;
+}
+
+esp_err_t camera_set_isp_gamma(bool enable, float gamma)
+{
+    if (g_fd < 0) {
+        ESP_LOGE(TAG, "Camera not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 生成 16 点 Gamma 曲线: x = 16, 32, 48, ..., 240, 255
+     * y = 255 * (x/255)^(1/gamma) */
+    esp_video_isp_gamma_t gamma_cfg = {
+        .enable = enable,
+    };
+
+    float inv_gamma = 1.0f / gamma;
+    for (int i = 0; i < ISP_GAMMA_CURVE_POINTS_NUM; i++) {
+        gamma_cfg.points[i].x = (i == ISP_GAMMA_CURVE_POINTS_NUM - 1)
+                                    ? 255
+                                    : (uint8_t)((i + 1) * 16);
+        float y = powf((float)gamma_cfg.points[i].x / 255.0f, inv_gamma) * 255.0f;
+        if (y > 255.0f) y = 255.0f;
+        gamma_cfg.points[i].y = (uint8_t)(y + 0.5f);
+    }
+
+    struct v4l2_ext_control ext_ctrl = {
+        .id   = V4L2_CID_USER_ESP_ISP_GAMMA,
+        .size = sizeof(gamma_cfg),
+        .ptr  = &gamma_cfg,
+    };
+
+    struct v4l2_ext_controls ext_ctrls = {
+        .ctrl_class = 0,
+        .count      = 1,
+        .controls   = &ext_ctrl,
+    };
+
+    if (ioctl(g_fd, VIDIOC_S_EXT_CTRLS, &ext_ctrls) != 0) {
+        ESP_LOGW(TAG, "ISP gamma control failed (errno=%d)", errno);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    ESP_LOGI(TAG, "ISP gamma: %s, gamma=%.1f",
+             enable ? "ON" : "OFF", (double)gamma);
     return ESP_OK;
 }
 

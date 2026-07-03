@@ -36,6 +36,9 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=256
 CONFIG_LV_FONT_MONTSERRAT_24=y
 
 # LVGL v9 adapter uses ESP_MAIN_TASK_STACK_SIZE instead
+# Increase for image preprocessing + model inference stack usage
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_MAIN_TASK_STACK_SIZE=16384
 
 # esp_video: enable MIPI-CSI video device (/dev/video0)
 CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y

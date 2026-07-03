@@ -1,7 +1,11 @@
 idf_component_register(SRCS "main.c"
                          "camera/camera_driver.c"
                          "detection/detection_driver.cpp"
+                         "display/display_driver.cpp"
+                         "image_processing/image_processing.cpp"
                     INCLUDE_DIRS "."
                                  "camera"
                                  "detection"
+                                 "display"
+                                 "image_processing"
                     REQUIRES esp_video coco_detect)
