@@ -1,0 +1,7 @@
+dependencies:
+  waveshare/esp32_p4_platform: "^1"
+  lvgl/lvgl: "^9"
+  espressif/usb: "*"
+  espressif/esp_video: "^2"
+  espressif/esp-dl: "^3.3"
+  espressif/coco_detect: "^0.4.0"

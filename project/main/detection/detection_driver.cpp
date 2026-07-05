@@ -49,8 +49,6 @@ static bool is_desktop_object(int category)
     case 67:  /* cell phone */
     case 73:  /* book */
     case 76:  /* scissors */
-    case 47:  /* apple */
-    case 49:  /* orange */
         return true;
     default:
         return false;
