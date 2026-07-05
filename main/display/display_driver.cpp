@@ -1,5 +1,10 @@
 /**
- * 显示驱动 —— LVGL UI、预览缓冲、按键状态管理
+ * 显示驱动 —— LVGL UI、双缓冲预览、按键状态管理
+ *
+ * 双缓冲架构:
+ *   g_preview_buf  — 前端缓冲区 (LVGL 读取, MIPI-DSI 送显)
+ *   g_render_buf   — 后端缓冲区 (主循环渲染, 弹珠绘制)
+ *   display_refresh_preview() — 原子交换前后端缓冲区
  *
  * 封装所有显示相关逻辑:
  *   - LVGL 界面构建 (标题、预览图像、状态标签、按钮)
@@ -30,12 +35,17 @@ static const char *TAG = "display";
 /* ---- 内部状态 ---- */
 static lv_obj_t  *g_status_label = NULL;
 static lv_obj_t  *g_preview_img  = NULL;
-static uint8_t   *g_preview_buf  = NULL;
+
+/* 双缓冲: front=LVGL读取, back=主循环写入 */
+static uint8_t       *g_preview_buf = NULL;   // 前端缓冲区
+static uint8_t       *g_render_buf  = NULL;   // 后端缓冲区
 static lv_image_dsc_t g_preview_dsc;
+static lv_image_dsc_t g_render_dsc;
 
 static volatile bool g_trigger_detect  = false;
 static volatile bool g_live_view       = false;
 static volatile bool g_edge_view       = false;
+static volatile bool g_track_capture   = false;
 
 /* ---- RGB565→Gray LUT (for edge preview grayscale conversion) ---- */
 static uint8_t r_lut[32];
@@ -101,13 +111,13 @@ static void scale_frame(const camera_frame_t *frame, uint8_t *dst_buf)
         .transform();
 }
 
-/* ---- 在预览缓冲上绘制检测框 ---- */
+/* ---- 在渲染缓冲上绘制检测框 ---- */
 static void draw_boxes_on_preview(const detection_result_t *detections, int det_count)
 {
     if (!detections || det_count <= 0) return;
 
     dl::image::img_t preview_img;
-    preview_img.data     = g_preview_buf;
+    preview_img.data     = g_render_buf;
     preview_img.width    = PREVIEW_W;
     preview_img.height   = PREVIEW_H;
     preview_img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
@@ -144,7 +154,7 @@ static void draw_boxes_on_preview(const detection_result_t *detections, int det_
     }
 }
 
-/* ---- 刷新 LVGL 预览图像 ---- */
+/* ---- 刷新 LVGL 预览图像 (内部, 假定已在 BSP 锁内) ---- */
 static void update_preview_display(void)
 {
     if (!g_preview_img) return;
@@ -184,13 +194,21 @@ static void btn_preproc_callback(lv_event_t *e)
     }
 }
 
+static void btn_track_capture_callback(lv_event_t *e)
+{
+    (void)e;
+    g_track_capture = true;
+    g_edge_view = true;       /* 自动进入边缘检测模式 */
+    g_live_view = false;
+}
+
 /* ========================================================================
  * 公开接口
  * ======================================================================== */
 
 esp_err_t display_init(void)
 {
-    ESP_LOGI(TAG, "Initializing display and LVGL...");
+    ESP_LOGI(TAG, "Initializing display and LVGL (double-buffered)...");
 
     /* 1. 启动显示 */
     lv_display_t *disp = bsp_display_start();
@@ -202,7 +220,43 @@ esp_err_t display_init(void)
     ESP_LOGI(TAG, "Display OK: %dx%d", BSP_LCD_H_RES, BSP_LCD_V_RES);
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    /* 2. 构建 UI */
+    /* 2. 分配双缓冲 (PSRAM) */
+    size_t buf_size = PREVIEW_W * PREVIEW_H * 2;  // 640*512*2 = 655,360 bytes
+
+    g_preview_buf = (uint8_t *)heap_caps_calloc(1, buf_size,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    g_render_buf  = (uint8_t *)heap_caps_calloc(1, buf_size,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_preview_buf || !g_render_buf) {
+        ESP_LOGE(TAG, "Failed to allocate preview buffers (dual)");
+        if (g_preview_buf) heap_caps_free(g_preview_buf);
+        if (g_render_buf)  heap_caps_free(g_render_buf);
+        g_preview_buf = NULL;
+        g_render_buf  = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    memset(g_preview_buf, 0x00, buf_size);
+    memset(g_render_buf,  0x00, buf_size);
+
+    /* 前端描述符 (LVGL 读取) */
+    g_preview_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
+    g_preview_dsc.header.w      = PREVIEW_W;
+    g_preview_dsc.header.h      = PREVIEW_H;
+    g_preview_dsc.header.stride = PREVIEW_W * 2;
+    g_preview_dsc.data          = g_preview_buf;
+    g_preview_dsc.data_size     = buf_size;
+
+    /* 后端描述符 (主循环写入) */
+    g_render_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
+    g_render_dsc.header.w      = PREVIEW_W;
+    g_render_dsc.header.h      = PREVIEW_H;
+    g_render_dsc.header.stride = PREVIEW_W * 2;
+    g_render_dsc.data          = g_render_buf;
+    g_render_dsc.data_size     = buf_size;
+
+    ESP_LOGI(TAG, "Dual buffers: %zu bytes each (PSRAM)", buf_size);
+
+    /* 3. 构建 UI */
     bsp_display_lock(portMAX_DELAY);
 
     /* 初始化灰度 LUT */
@@ -218,23 +272,7 @@ esp_err_t display_init(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
 
-    /* 预览图像 (640x512 RGB565, 居中) */
-    g_preview_buf = (uint8_t *)heap_caps_calloc(1, PREVIEW_W * PREVIEW_H * 2,
-                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!g_preview_buf) {
-        ESP_LOGE(TAG, "Failed to allocate preview buffer");
-        bsp_display_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-    memset(g_preview_buf, 0x00, PREVIEW_W * PREVIEW_H * 2);
-
-    g_preview_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
-    g_preview_dsc.header.w      = PREVIEW_W;
-    g_preview_dsc.header.h      = PREVIEW_H;
-    g_preview_dsc.header.stride = PREVIEW_W * 2;
-    g_preview_dsc.data          = g_preview_buf;
-    g_preview_dsc.data_size     = PREVIEW_W * PREVIEW_H * 2;
-
+    /* 预览图像 (640x512 RGB565, 居中, 指向前端缓冲区) */
     g_preview_img = lv_image_create(scr);
     lv_image_set_src(g_preview_img, &g_preview_dsc);
     lv_obj_align(g_preview_img, LV_ALIGN_CENTER, 0, -10);
@@ -254,33 +292,41 @@ esp_err_t display_init(void)
         }
     }
 
-    /* 按钮 (4 个, 底部居中排列) */
+    /* 按钮 (5 个, 底部居中排列) */
     lv_obj_t *btn_preview = lv_button_create(scr);
-    lv_obj_set_size(btn_preview, 110, 40);
+    lv_obj_set_size(btn_preview, 80, 40);
     lv_obj_align(btn_preview, LV_ALIGN_BOTTOM_MID, -180, -5);
     lv_obj_add_event_cb(btn_preview, btn_preview_callback, LV_EVENT_CLICKED, NULL);
     lv_obj_t *btn_preview_label = lv_label_create(btn_preview);
-    lv_label_set_text(btn_preview_label, "Live View");
+    lv_label_set_text(btn_preview_label, "Live");
     lv_obj_center(btn_preview_label);
 
     lv_obj_t *btn_edge = lv_button_create(scr);
-    lv_obj_set_size(btn_edge, 110, 40);
-    lv_obj_align(btn_edge, LV_ALIGN_BOTTOM_MID, -60, -5);
+    lv_obj_set_size(btn_edge, 80, 40);
+    lv_obj_align(btn_edge, LV_ALIGN_BOTTOM_MID, -90, -5);
     lv_obj_add_event_cb(btn_edge, btn_edge_callback, LV_EVENT_CLICKED, NULL);
     lv_obj_t *btn_edge_label = lv_label_create(btn_edge);
     lv_label_set_text(btn_edge_label, "Edge");
     lv_obj_center(btn_edge_label);
 
+    lv_obj_t *btn_track = lv_button_create(scr);
+    lv_obj_set_size(btn_track, 80, 40);
+    lv_obj_align(btn_track, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_add_event_cb(btn_track, btn_track_capture_callback, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_track_label = lv_label_create(btn_track);
+    lv_label_set_text(btn_track_label, "Track");
+    lv_obj_center(btn_track_label);
+
     lv_obj_t *btn_preproc = lv_button_create(scr);
-    lv_obj_set_size(btn_preproc, 110, 40);
-    lv_obj_align(btn_preproc, LV_ALIGN_BOTTOM_MID, 60, -5);
+    lv_obj_set_size(btn_preproc, 80, 40);
+    lv_obj_align(btn_preproc, LV_ALIGN_BOTTOM_MID, 90, -5);
     lv_obj_add_event_cb(btn_preproc, btn_preproc_callback, LV_EVENT_CLICKED, NULL);
     g_btn_preproc_label = lv_label_create(btn_preproc);
     lv_label_set_text(g_btn_preproc_label, g_preproc_names[g_preproc_idx]);
     lv_obj_center(g_btn_preproc_label);
 
     lv_obj_t *btn_detect = lv_button_create(scr);
-    lv_obj_set_size(btn_detect, 110, 40);
+    lv_obj_set_size(btn_detect, 80, 40);
     lv_obj_align(btn_detect, LV_ALIGN_BOTTOM_MID, 180, -5);
     lv_obj_add_event_cb(btn_detect, btn_detect_callback, LV_EVENT_CLICKED, NULL);
     lv_obj_t *btn_detect_label = lv_label_create(btn_detect);
@@ -289,7 +335,7 @@ esp_err_t display_init(void)
 
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "Display UI ready");
+    ESP_LOGI(TAG, "Display UI ready (double-buffered)");
     return ESP_OK;
 }
 
@@ -297,21 +343,9 @@ esp_err_t display_update_preview(const camera_frame_t *frame,
                                   const detection_result_t *detections,
                                   int det_count)
 {
-    if (!frame || !frame->buffer || !g_preview_buf) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    /* 1. 缩放 (ImageTransformer 替代手写 scale_frame) */
-    scale_frame(frame, g_preview_buf);
-
-    /* 2. 绘制检测框 (如果有) */
-    draw_boxes_on_preview(detections, det_count);
-
-    /* 3. 刷新 LVGL */
-    bsp_display_lock(portMAX_DELAY);
-    update_preview_display();
-    bsp_display_unlock();
-
+    esp_err_t ret = display_prepare_preview(frame, detections, det_count);
+    if (ret != ESP_OK) return ret;
+    display_refresh_preview();
     return ESP_OK;
 }
 
@@ -349,19 +383,28 @@ bool display_is_edge_view(void)
     return g_edge_view;
 }
 
+bool display_track_capture_triggered(void)
+{
+    if (g_track_capture) {
+        g_track_capture = false;
+        return true;
+    }
+    return false;
+}
+
 esp_err_t display_update_edge_preview(const camera_frame_t *frame,
                                        const uint8_t *edge_map,
                                        int ew, int eh)
 {
-    if (!frame || !frame->buffer || !g_preview_buf) {
+    if (!frame || !frame->buffer || !g_render_buf) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* 1. 缩放相机帧到预览尺寸 (800x640 → 640x512) */
-    scale_frame(frame, g_preview_buf);
+    /* 1. 缩放相机帧到渲染缓冲 (800x640 → 640x512) */
+    scale_frame(frame, g_render_buf);
 
-    /* 2. 预览缓冲转换为灰度 RGB565 */
-    uint16_t *pixels = (uint16_t *)g_preview_buf;
+    /* 2. 渲染缓冲转换为灰度 RGB565 */
+    uint16_t *pixels = (uint16_t *)g_render_buf;
     int total = PREVIEW_W * PREVIEW_H;
     for (int i = 0; i < total; i++) {
         uint16_t p = pixels[i];
@@ -395,10 +438,56 @@ esp_err_t display_update_edge_preview(const camera_frame_t *frame,
         }
     }
 
-    /* 4. 刷新 LVGL 显示 */
-    bsp_display_lock(portMAX_DELAY);
-    update_preview_display();
-    bsp_display_unlock();
+    /* 不在此刷新 LVGL — 由调用者在 marble_draw 后统一 display_refresh_preview() */
+    return ESP_OK;
+}
+
+uint8_t *display_get_preview_buf(int *w, int *h)
+{
+    if (w) *w = PREVIEW_W;
+    if (h) *h = PREVIEW_H;
+    return g_preview_buf;
+}
+
+uint8_t *display_get_render_buf(int *w, int *h)
+{
+    if (w) *w = PREVIEW_W;
+    if (h) *h = PREVIEW_H;
+    return g_render_buf;
+}
+
+esp_err_t display_prepare_preview(const camera_frame_t *frame,
+                                   const detection_result_t *detections,
+                                   int det_count)
+{
+    if (!frame || !frame->buffer || !g_render_buf) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 缩放相机帧到后端渲染缓冲 */
+    scale_frame(frame, g_render_buf);
+
+    /* 在后端缓冲上绘制检测框 */
+    draw_boxes_on_preview(detections, det_count);
 
     return ESP_OK;
+}
+
+void display_refresh_preview(void)
+{
+    bsp_display_lock(portMAX_DELAY);
+
+    /* 原子交换前后端缓冲区 */
+    uint8_t *tmp_buf = g_preview_buf;
+    g_preview_buf = g_render_buf;
+    g_render_buf  = tmp_buf;
+
+    /* 更新描述符中的数据指针 */
+    g_preview_dsc.data = g_preview_buf;
+    g_render_dsc.data  = g_render_buf;
+
+    /* 通知 LVGL 重绘 (此时 g_preview_buf 是完整的) */
+    update_preview_display();
+
+    bsp_display_unlock();
 }

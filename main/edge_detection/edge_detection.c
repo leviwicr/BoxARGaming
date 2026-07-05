@@ -78,7 +78,7 @@ static void rgb565_to_gray(const uint8_t *rgb565, int w, int h)
 
 /* ========================================================================
  * Stage 2: 高斯模糊 3x3 (可分离 1D 卷积)
- * 降低分辨率时，（略）等效于进行了模糊
+ *
  * 核 [1, 2, 1] / 4, 先水平再垂直。
  * 边界处理: 复制边缘像素。
  * ======================================================================== */
@@ -339,9 +339,9 @@ esp_err_t edge_detect_init(void)
     g_buf_w = max_w;
     g_buf_h = max_h;
 
-    size_t total_kb = (npixels * (1 + 1 + 2 + 1 + 2 + 1)) / 1024;
-    ESP_LOGI(TAG, "Init OK (max %dx%d, 6 buffers: %zu KB)",
-             max_w, max_h, total_kb);
+    ESP_LOGI(TAG, "Init OK (max %dx%d, buffers %zu KB)",
+             max_w, max_h,
+             (npixels * (1 + 1 + 2 + 1)) / 1024);
     return ESP_OK;
 }
 

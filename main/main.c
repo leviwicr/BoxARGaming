@@ -17,6 +17,11 @@
 #include "display/display_driver.h"
 #include "image_processing/image_processing.hpp"
 #include "edge_detection/edge_detection.h"
+#include "esp_timer.h"
+#include "imu/imu_driver.h"
+#include "physics/marble_physics.h"
+#include "track/track_collision.h"
+#include "game/game_render.h"
 
 static const char *TAG = "main";
 
@@ -50,24 +55,30 @@ void app_main(void)
         ESP_LOGW(TAG, "Preprocessing init failed, continuing without it");
     }
 
-    /* ---- 3b. 初始化边缘检测模块 ---- */
-    ret = edge_detect_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Edge detection init FAILED: %s", esp_err_to_name(ret));
-    }
+    /* 注: edge_detect 和 track_collision 延迟到首次按 Track 时再初始化,
+     *     避免启动时占用 PSRAM 导致 YOLO 模型无法加载。 */
 
     /* ---- 4. 相机预热 ---- */
     display_set_status("Status: Warming up...", 0x00FF00);
     camera_warmup(10);
 
+    /* ---- 5. 初始化IMU + 弹珠物理 (相机预热后, I2C总线已稳定) ---- */
+    vTaskDelay(pdMS_TO_TICKS(100));   /* 等 I2C 总线彻底释放 */
+    ret = imu_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "IMU init failed (non-fatal): %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "IMU ready");
+        marble_physics_init();
+    }
+
     display_set_status("Ready! Press LIVE VIEW or DETECT", 0x00FF00);
     ESP_LOGI(TAG, "Camera ready");
 
-    /* ---- 5. 主循环 ---- */
+    /* ---- 6. 主循环 ---- */
     bool was_live_view = false;
     bool was_edge_view = false;
-    uint8_t *edge_map  = edge_get_edge_map_buf();
-    uint8_t *ds_buf    = edge_get_downscale_buf();
+    uint64_t last_status_log = 0;
 
     while (1) {
         /* 处理检测触发 */
@@ -114,8 +125,15 @@ void app_main(void)
             int det_count = DETECTION_MAX_OBJECTS;
             ret = detection_run(&display_frame, detections, &det_count, PREPROC_FLAG_NONE);
 
-            /* 更新预览 (预处理后的画面 + 检测框) */
-            display_update_preview(&display_frame, detections, det_count);
+            /* 更新预览 + 弹珠叠加 (仅赛道捕获后) */
+            display_prepare_preview(&display_frame, detections, det_count);
+            int pw, ph;
+            uint8_t *pbuf = display_get_render_buf(&pw, &ph);
+            if (pbuf && track_is_built()) {
+                track_render((uint16_t *)pbuf, pw, ph, 0xF800);
+                marble_draw((uint16_t *)pbuf, pw, ph);
+            }
+            display_refresh_preview();
 
             /* 释放预处理缓冲区 */
             if (proc_buf) {
@@ -143,28 +161,137 @@ void app_main(void)
 
     detect_done:
 
-        /* 边缘检测模式 (与 Live View 互斥) */
+        /* ================================================================
+         * 边缘检测 / 游戏模式
+         *
+         * 两阶段:
+         *   设置阶段 (track 未捕获): 相机灰度预览, 对准赛道按 Track
+         *   游戏阶段 (track 已捕获): 纯画布, 赛道墙壁 + 弹珠, 无相机
+         * ================================================================ */
         if (display_is_edge_view()) {
             if (!was_edge_view) {
-                ESP_LOGI(TAG, "Edge view ON");
-                display_set_status("Edge View ON  (press again to stop)", 0x00AAFF);
+                if (track_is_built()) {
+                    ESP_LOGI(TAG, "Game mode ON");
+                    display_set_status("GAME ON  Tilt to play!", 0x00FF00);
+                } else {
+                    ESP_LOGI(TAG, "Edge view ON (setup)");
+                    display_set_status("Point camera at track & press Track",
+                                       0xFFCC00);
+                }
                 was_edge_view = true;
                 was_live_view = false;
             }
 
-            camera_frame_t frame;
-            ret = camera_capture_frame(&frame, 2000);
-            if (ret == ESP_OK) {
-                /* 下采样: 800x640 → 400x320 (2x 区域平均) */
-                edge_downscale_half(frame.buffer, frame.width, frame.height, ds_buf);
+            /* ---- 游戏阶段: 纯画布渲染, 不读相机 ---- */
+            if (track_is_built()) {
+                /* 处理重新捕获 (Track 按钮) */
+                if (display_track_capture_triggered()) {
+                    camera_frame_t frame;
+                    ret = camera_capture_frame(&frame, 2000);
+                    if (ret == ESP_OK) {
+                        /* 延迟初始化 edge (若模型已加载, PSRAM 紧张但仍应够用) */
+                        if (!edge_get_downscale_buf()) {
+                            edge_detect_init();
+                        }
+                        uint8_t *ds_buf = edge_get_downscale_buf();
+                        uint8_t *emap   = edge_get_edge_map_buf();
+                        edge_downscale_half(frame.buffer, frame.width,
+                                            frame.height, ds_buf);
+                        edge_detect_run(ds_buf, EDGE_DOWNSCALE_W,
+                                       EDGE_DOWNSCALE_H, emap,
+                                       CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
 
-                /* Canny 边缘检测 */
-                edge_detect_run(ds_buf, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
-                                edge_map, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
+                        track_collision_init(); /* 初次时分配, 后续跳过 */
+                        track_build_from_edges(emap, EDGE_DOWNSCALE_W,
+                                               EDGE_DOWNSCALE_H);
+                        edge_detect_deinit();   /* 释放 ~1MB PSRAM (emap已用完) */
 
-                /* 渲染: 灰度预览 + 彩色边缘叠加 */
-                display_update_edge_preview(&frame, edge_map,
-                                            EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H);
+                        /* 同一帧跑检测 + 提取物体轮廓 */
+                        {
+                            detection_result_t dets[DETECTION_MAX_OBJECTS];
+                            int dc = DETECTION_MAX_OBJECTS;
+                            if (detection_run(&frame, dets, &dc, PREPROC_FLAG_NONE) == ESP_OK && dc > 0) {
+                                game_extract_contours(&frame, dets, dc);
+                                ESP_LOGI(TAG, "Track + %d object contours", dc);
+                            } else {
+                                game_extract_contours(NULL, NULL, 0);
+                            }
+                        }
+
+                        marble_physics_reset();
+                        display_set_status("Track updated!  GAME ON", 0x00FF00);
+                        ESP_LOGI(TAG, "Track re-captured");
+                    }
+                }
+
+                /* 纯画布: 背景 + 赛道墙 + 弹珠 */
+                int pw, ph;
+                uint8_t *pbuf = display_get_render_buf(&pw, &ph);
+                if (pbuf) {
+                    game_render_frame((uint16_t *)pbuf, pw, ph);
+                }
+                display_refresh_preview();
+                vTaskDelay(pdMS_TO_TICKS(16));   /* ~60fps 帧率限制 */
+            }
+            /* ---- 设置阶段: 相机灰度预览 ---- */
+            else {
+                camera_frame_t frame;
+                ret = camera_capture_frame(&frame, 2000);
+                if (ret == ESP_OK) {
+                    bool just_captured = false;
+
+                    if (display_track_capture_triggered()) {
+                        /* 延迟初始化 edge (若模型已加载, PSRAM 紧张但仍应够用) */
+                        if (!edge_get_downscale_buf()) {
+                            edge_detect_init();
+                        }
+                        uint8_t *ds_buf = edge_get_downscale_buf();
+                        uint8_t *emap   = edge_get_edge_map_buf();
+                        edge_downscale_half(frame.buffer, frame.width,
+                                            frame.height, ds_buf);
+                        edge_detect_run(ds_buf, EDGE_DOWNSCALE_W,
+                                       EDGE_DOWNSCALE_H, emap,
+                                       CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
+
+                        track_collision_init(); /* 初次时分配, 后续跳过 */
+                        track_build_from_edges(emap, EDGE_DOWNSCALE_W,
+                                               EDGE_DOWNSCALE_H);
+                        edge_detect_deinit();   /* 释放 ~1MB PSRAM */
+
+                        /* 同一帧跑检测 + 提取物体轮廓 */
+                        {
+                            detection_result_t dets[DETECTION_MAX_OBJECTS];
+                            int dc = DETECTION_MAX_OBJECTS;
+                            if (detection_run(&frame, dets, &dc, PREPROC_FLAG_NONE) == ESP_OK && dc > 0) {
+                                game_extract_contours(&frame, dets, dc);
+                                ESP_LOGI(TAG, "Track + %d object contours", dc);
+                            } else {
+                                game_extract_contours(NULL, NULL, 0);
+                            }
+                        }
+
+                        marble_physics_reset();
+                        just_captured = true;
+                        ESP_LOGI(TAG, "Track captured — game on!");
+                    }
+
+                    if (just_captured) {
+                        /* 刚捕获: 立即切到游戏画布 */
+                        display_set_status("GAME ON  Tilt to play!", 0x00FF00);
+                        int pw, ph;
+                        uint8_t *pbuf = display_get_render_buf(&pw, &ph);
+                        if (pbuf) {
+                            game_render_frame((uint16_t *)pbuf, pw, ph);
+                        }
+                        display_refresh_preview();
+                    } else {
+                        /* 未捕获: 灰度预览 + 提示 */
+                        display_update_edge_preview(&frame, NULL,
+                                                    EDGE_DOWNSCALE_W,
+                                                    EDGE_DOWNSCALE_H);
+                        display_refresh_preview();
+                    }
+                }
             }
         }
         /* 实时预览模式 */
@@ -179,7 +306,16 @@ void app_main(void)
             camera_frame_t frame;
             ret = camera_capture_frame(&frame, 2000);
             if (ret == ESP_OK) {
-                display_update_preview(&frame, NULL, 0);
+                display_prepare_preview(&frame, NULL, 0);
+                int pw, ph;
+                uint8_t *pbuf = display_get_render_buf(&pw, &ph);
+                if (pbuf) {
+                    if (track_is_built()) {
+                        track_render((uint16_t *)pbuf, pw, ph, 0xF800);
+                        marble_draw((uint16_t *)pbuf, pw, ph);
+                    }
+                }
+                display_refresh_preview();
             }
         }
         /* 空闲 */
@@ -194,6 +330,20 @@ void app_main(void)
                 display_set_status("Edge View OFF  (press DETECT)", 0x00FF00);
                 was_edge_view = false;
             }
+
+            /* 周期性弹珠状态日志 */
+            uint64_t now = esp_timer_get_time();
+            if (now - last_status_log > 5000000) {
+                last_status_log = now;
+                imu_attitude_t att;
+                marble_state_t mb;
+                marble_physics_get_state(&mb);
+                if (imu_get_attitude(&att) == ESP_OK) {
+                    ESP_LOGI(TAG, "IMU: p=%.1f r=%.1f | Marble: (%.0f,%.0f) v=(%.0f,%.0f)",
+                             att.pitch, att.roll, mb.x, mb.y, mb.vx, mb.vy);
+                }
+            }
+
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }

@@ -42,15 +42,12 @@ extern "C" {
 #define GRAVITY_MAGNITUDE       (9.8f * PIXELS_PER_METER)  // 重力加速度(像素/s²)
 #define GLOBAL_FRICTION         0.05f   // 全局摩擦系数(大理石桌面)
 #define GOAL_THRESHOLD          20.0f   // 到达终点的判定距离(像素)
-#define MARBLE_MAX_SPEED        2000.0f // 弹珠最大速度限制(像素/s)
+#define MARBLE_MAX_SPEED        5000.0f // 弹珠最大速度限制(像素/s)
 
 /* ------------------------------ IMU配置 ------------------------------ */
-#define IMU_ENABLED             0       // 是否启用真实IMU (阶段6设为1)
-#define IMU_I2C_SCL_IO          -1      // 占位, 实际连接后修改
-#define IMU_I2C_SDA_IO          -1      // 占位
-#define IMU_I2C_PORT            0       // 独立I2C端口
-#define IMU_I2C_ADDR            0x68    // MPU6050默认地址
-#define IMU_I2C_FREQ_HZ         400000  // 400kHz
+#define IMU_ENABLED             1       // 是否启用真实IMU
+#define IMU_I2C_SCL_IO          4       // IMU独立I2C总线 SCL引脚 (I2C0)
+#define IMU_I2C_SDA_IO          5       // IMU独立I2C总线 SDA引脚 (I2C0)
 #define IMU_FILTER_ALPHA        0.98f   // 互补滤波系数
 
 /* ------------------------------ 图像预处理配置 ------------------------------ */
