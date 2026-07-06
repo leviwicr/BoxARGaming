@@ -8,6 +8,8 @@
 #include "game_render.h"
 #include "track/track_collision.h"
 #include "physics/marble_physics.h"
+#include "pixel_game/pixel_world.h"
+#include "pixel_game/pixel_sprite.h"
 #include "config.h"
 #include "esp_log.h"
 #include <string.h>
@@ -362,4 +364,100 @@ void game_render_frame(uint16_t *buf, int w, int h)
             }
         }
     }
+}
+
+/* ========================================================================
+ * Pixel Game Rendering (Terraria-style)
+ *
+ * Renders the full pixel game world to a 640x640 RGB565 buffer.
+ * Pipeline: floor → tilemap → objects → marble.
+ * ======================================================================== */
+
+/* Floor colors (Terraria-style dirt/grass) */
+#define FLOOR_COLOR1  ((uint16_t)(((34 >> 3) << 11) | ((50 >> 2) << 5) | (18 >> 3)))
+#define FLOOR_COLOR2  ((uint16_t)(((40 >> 3) << 11) | ((55 >> 2) << 5) | (22 >> 3)))
+#define FLOOR_COLOR3  ((uint16_t)(((28 >> 3) << 11) | ((42 >> 2) << 5) | (15 >> 3)))
+
+static inline uint32_t floor_hash(unsigned int x, unsigned int y)
+{
+    uint32_t h = x * 374761393u + y * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+
+static uint16_t floor_color_at(int px, int py)
+{
+    int tile_x = px / 16;
+    int tile_y = py / 16;
+    uint32_t h = floor_hash((unsigned int)tile_x, (unsigned int)tile_y);
+
+    uint16_t base;
+    switch (h % 5) {
+        case 0: base = FLOOR_COLOR1; break;
+        case 1: base = FLOOR_COLOR2; break;
+        case 2: base = FLOOR_COLOR1; break;
+        case 3: base = FLOOR_COLOR3; break;
+        default: base = FLOOR_COLOR2; break;
+    }
+
+    uint32_t hp = floor_hash((unsigned int)px, (unsigned int)py);
+    int r = (int)(((base >> 11) & 0x1F) * 255 / 31);
+    int g = (int)(((base >> 5)  & 0x3F) * 255 / 63);
+    int b = (int)(( base        & 0x1F) * 255 / 31);
+
+    int noise = (int)(hp % 13) - 6;
+    r += noise; g += noise; b += noise;
+    if (r < 0) { r = 0; } else if (r > 255) { r = 255; }
+    if (g < 0) { g = 0; } else if (g > 255) { g = 255; }
+    if (b < 0) { b = 0; } else if (b > 255) { b = 255; }
+
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+void game_render_pixel_frame(uint16_t *buf, int w, int h)
+{
+    if (!buf || w < 640 || h < 640) return;
+
+    pixel_world_t *world = pixel_world_get();
+
+    /* 1. Fill floor background */
+    for (int y = 0; y < GAME_MAP_PIXELS; y++) {
+        for (int x = 0; x < GAME_MAP_PIXELS; x++) {
+            buf[y * w + x] = floor_color_at(x, y);
+        }
+    }
+
+    /* 2. Draw tilemap (walls, broken tiles) */
+    if (world && pixel_world_is_built()) {
+        for (int ty = 0; ty < GAME_MAP_TILES; ty++) {
+            for (int tx = 0; tx < GAME_MAP_TILES; tx++) {
+                tile_type_t t = (tile_type_t)world->tilemap[ty][tx];
+                if (t == TILE_EMPTY) continue;
+
+                const sprite_t *sp = sprite_get_tile(t);
+                if (sp) {
+                    sprite_blit(buf, w, sp, tx * GAME_TILE_SIZE, ty * GAME_TILE_SIZE);
+                }
+            }
+        }
+
+        /* 3. Draw game objects */
+        for (int i = 0; i < world->object_count; i++) {
+            game_object_t *obj = &world->objects[i];
+            if (!obj->alive) continue;
+
+            const sprite_t *sp = sprite_get_by_coco(obj->coco_id);
+            if (!sp) {
+                sp = sprite_get_obj(obj->type);
+            }
+            if (!sp) continue;
+
+            int sx = obj->pixel_x - sp->w / 2;
+            int sy = obj->pixel_y - sp->h / 2;
+            sprite_blit_keyed_edgeblend(buf, w, sp, sx, sy, 0xF81F);
+        }
+    }
+
+    /* 4. Draw marble (3D metal ball, 1:1 scale) */
+    marble_draw_game(buf, w, h);
 }

@@ -42,7 +42,7 @@ extern "C" {
 #define GRAVITY_MAGNITUDE       (9.8f * PIXELS_PER_METER)  // 重力加速度(像素/s²)
 #define GLOBAL_FRICTION         0.05f   // 全局摩擦系数(大理石桌面)
 #define GOAL_THRESHOLD          20.0f   // 到达终点的判定距离(像素)
-#define MARBLE_MAX_SPEED        5000.0f // 弹珠最大速度限制(像素/s)
+#define MARBLE_MAX_SPEED        2000.0f // 弹珠最大速度限制(像素/s)
 
 /* ------------------------------ IMU配置 ------------------------------ */
 #define IMU_ENABLED             1       // 是否启用真实IMU
@@ -88,6 +88,36 @@ extern "C" {
 #define CANNY_LOW_THRESHOLD     30      // Canny 低阈值 (弱边缘)
 #define CANNY_HIGH_THRESHOLD    90      // Canny 高阈值 (强边缘)
 #define EDGE_COLOR_RGB565       0x07FF  // 边缘线条颜色 (Cyan: R=0,G=63,B=31)
+
+/* ------------------------------ 像素游戏配置 ------------------------------ */
+#define GAME_TILE_SIZE          16      /* 瓦片边长(像素) */
+#define GAME_MAP_TILES          40      /* 每行/列瓦片数 (640/16) */
+#define GAME_MAP_PIXELS         640     /* 游戏地图像素尺寸 */
+#define GAME_FPS                30      /* 游戏渲染帧率 */
+#define GAME_AREA_X             20      /* 游戏区在屏幕上的X偏移 (横屏) */
+#define GAME_AREA_Y             50      /* 游戏区在屏幕上的Y偏移 (横屏) */
+
+/* 游戏物理参数 */
+#define GAME_WALL_PASS_MS       5000    /* 穿墙Buff持续时间(ms) */
+#define GAME_PORTAL_COOLDOWN_MS 1000    /* 传送门冷却时间(ms) */
+#define GAME_BOOK_BREAK_SPEED   500     /* 破坏书墙速度阈值(px/s) */
+#define GAME_BOOK_BREAK_DAMP    0.7f    /* 撞碎书墙速度保留系数 */
+
+/* 弹力系数 */
+#define GAME_BOUNCE_DEFAULT     0.55f   /* 默认石墙反弹系数 */
+#define GAME_BOUNCE_LOW         0.15f   /* cup/spoon */
+#define GAME_BOUNCE_MED         0.40f   /* keyboard */
+#define GAME_BOUNCE_HIGH        0.85f   /* cell phone */
+
+/* 物体碰撞半径(像素) */
+#define GAME_FRUIT_RADIUS       12
+#define GAME_PORTAL_RADIUS      20
+#define GAME_DEATH_RADIUS       16
+#define GAME_GOAL_RADIUS        14
+#define GAME_SURFACE_RADIUS     24
+
+/* 精灵模式: 0=程序化生成, 1=PNG资源(后续阶段) */
+#define GAME_SPRITE_MODE        0
 
 #ifdef __cplusplus
 }

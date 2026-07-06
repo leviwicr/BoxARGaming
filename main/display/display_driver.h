@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "camera/camera_driver.h"
 #include "detection/detection_driver.h"
+#include "pixel_game/pixel_world.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +68,65 @@ bool display_is_edge_view(void);
  * @return true if "Capture Track" button was pressed since last check
  */
 bool display_track_capture_triggered(void);
+
+/* ---- Pixel game mode API ---- */
+
+/**
+ * @brief Check if game mode capture was triggered (Game button pressed)
+ * @return true if Game capture was triggered
+ */
+bool display_game_capture_triggered(void);
+
+/**
+ * @brief Check if exit game was requested (Game button pressed during game)
+ * @return true if exit requested
+ */
+bool display_game_exit_triggered(void);
+
+/**
+ * @brief Initialize game mode: allocates 640x640 double buffers, switches to landscape
+ * @return ESP_OK on success
+ */
+esp_err_t display_init_game_mode(void);
+
+/**
+ * @brief Exit game mode: frees game buffers, restores portrait UI
+ */
+void display_exit_game_mode(void);
+
+/**
+ * @brief Get pointer to game render buffer (640x640 RGB565, back buffer)
+ * @param w Output: buffer width (640)
+ * @param h Output: buffer height (640)
+ * @return pointer to game render buffer (back buffer)
+ */
+uint8_t *display_get_game_render_buf(int *w, int *h);
+
+/**
+ * @brief Swap game buffers and refresh LVGL display
+ */
+void display_refresh_game(void);
+
+/**
+ * @brief Update game HUD labels on the right panel
+ * @param marble_x, marble_y  Marble position in game coords (0..639)
+ * @param speed              Marble speed (px/s)
+ * @param tilt_x, tilt_y     IMU tilt angle (degrees)
+ * @param wall_pass_ms       Wall-pass remaining ms, 0 if inactive
+ * @param bounce_label       Bounce coefficient label string
+ * @param objects            Game objects array (NULL if none)
+ * @param object_count       Number of objects
+ */
+void display_update_game_hud(float marble_x, float marble_y, float speed,
+                             float tilt_x, float tilt_y,
+                             int wall_pass_ms, const char *bounce_label,
+                             const game_object_t *objects, int object_count);
+
+/**
+ * @brief Show game end screen (WIN or LOSE)
+ * @param is_win true=you win, false=game over
+ */
+void display_show_game_end(bool is_win);
 
 /**
  * @brief Prepare edge detection preview in render buffer (no LVGL refresh)

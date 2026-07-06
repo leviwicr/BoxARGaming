@@ -2,6 +2,8 @@
 #include "config.h"
 #include "imu/imu_driver.h"
 #include "track/track_collision.h"
+#include "pixel_game/pixel_world.h"
+#include "pixel_game/pixel_sprite.h"
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -9,20 +11,32 @@
 
 static const char *TAG = "marble";
 
-#define MARBLE_RADIUS_PX    25
-#define ACCEL_MAX           3000.0f
-#define FRICTION_COEFF      0.25f
+#define MARBLE_RADIUS_PX    8
+#define ACCEL_MAX           1200.0f
+#define FRICTION_COEFF      0.50f
 #define BOUND_BOUNCE        0.35f
 #define TRACK_BOUNCE        0.55f    /* 赛道墙壁恢复系数 */
-#define DEAD_ZONE_DEG       3.0f
+#define DEAD_ZONE_DEG       5.0f
 
 static marble_state_t g_marble;
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* ---- Game mode state ---- */
+static bool             g_wall_pass_active = false;
+static int              g_wall_pass_timer_ms = 0;
+static float            g_bounce_mult = 1.0f;
+static marble_game_cb_t g_game_cb = NULL;
+
 /* ---- 圆周采样点 (预计算, 避免运行时 sin/cos) ---- */
-#define TRACK_SAMPLES  12
-static const float sample_cos[TRACK_SAMPLES] = {1,0.866f,0.5f,0,-0.5f,-0.866f,-1,-0.866f,-0.5f,0,0.5f,0.866f};
-static const float sample_sin[TRACK_SAMPLES] = {0,0.5f,0.866f,1,0.866f,0.5f,0,-0.5f,-0.866f,-1,-0.866f,-0.5f};
+#define TRACK_SAMPLES  24
+static const float sample_cos[TRACK_SAMPLES] = {
+    1,0.9659f,0.866f,0.7071f,0.5f,0.2588f,0,-0.2588f,-0.5f,-0.7071f,-0.866f,-0.9659f,
+    -1,-0.9659f,-0.866f,-0.7071f,-0.5f,-0.2588f,0,0.2588f,0.5f,0.7071f,0.866f,0.9659f
+};
+static const float sample_sin[TRACK_SAMPLES] = {
+    0,0.2588f,0.5f,0.7071f,0.866f,0.9659f,1,0.9659f,0.866f,0.7071f,0.5f,0.2588f,
+    0,-0.2588f,-0.5f,-0.7071f,-0.866f,-0.9659f,-1,-0.9659f,-0.866f,-0.7071f,-0.5f,-0.2588f
+};
 
 static void physics_task(void *arg)
 {
@@ -50,6 +64,20 @@ static void physics_task(void *arg)
 
         portENTER_CRITICAL(&g_lock);
 
+        /* Game callback (fruit pickup, portal, death, goal, surface zones) */
+        if (g_game_cb) {
+            g_game_cb(&g_marble, dt);
+        }
+
+        /* Wall-pass buff timer */
+        if (g_wall_pass_active) {
+            g_wall_pass_timer_ms -= (int)(dt * 1000.0f);
+            if (g_wall_pass_timer_ms <= 0) {
+                g_wall_pass_timer_ms = 0;
+                g_wall_pass_active = false;
+            }
+        }
+
         /* 半隐式欧拉积分 */
         g_marble.vx += ax * dt;
         g_marble.vy += ay * dt;
@@ -62,7 +90,7 @@ static void physics_task(void *arg)
         float new_y = g_marble.y + g_marble.vy * dt;
 
         /* ---- 赛道墙壁碰撞检测 ---- */
-        if (track_is_built()) {
+        if (track_is_built() && !g_wall_pass_active) {
             float r = MARBLE_RADIUS_PX;
             float total_nx = 0, total_ny = 0;
             int hits = 0;
@@ -102,12 +130,29 @@ static void physics_task(void *arg)
                     /* 速度反射: v' = v - 2*(v·n)*n * restitution */
                     float vn = g_marble.vx * total_nx + g_marble.vy * total_ny;
                     if (vn < 0) {  /* 仅当朝向墙壁运动时才反弹 */
-                        g_marble.vx -= (1.0f + TRACK_BOUNCE) * vn * total_nx;
-                        g_marble.vy -= (1.0f + TRACK_BOUNCE) * vn * total_ny;
+                        float bounce = TRACK_BOUNCE * g_bounce_mult;
+                        g_marble.vx -= (1.0f + bounce) * vn * total_nx;
+                        g_marble.vy -= (1.0f + bounce) * vn * total_ny;
 
                         /* 推开: 将球沿法线推出墙壁 */
-                        new_x += total_nx * 3.0f;
-                        new_y += total_ny * 3.0f;
+                        new_x += total_nx * 6.0f;
+                        new_y += total_ny * 6.0f;
+
+                        /* 书墙破坏检测: 碰撞点瓦片为BOOK_WALL且速度足够 */
+                        if (pixel_world_is_built()) {
+                            float speed = sqrtf(g_marble.vx * g_marble.vx +
+                                                g_marble.vy * g_marble.vy);
+                            if (speed > GAME_BOOK_BREAK_SPEED) {
+                                int tile_x = (int)new_x / 16;
+                                int tile_y = (int)new_y / 16;
+                                tile_type_t t = pixel_world_get_tile(tile_x, tile_y);
+                                if (t == TILE_BOOK_WALL) {
+                                    pixel_world_destroy_tile(tile_x, tile_y);
+                                    g_marble.vx *= GAME_BOOK_BREAK_DAMP;
+                                    g_marble.vy *= GAME_BOOK_BREAK_DAMP;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -165,6 +210,71 @@ void marble_physics_reset(void)
     g_marble.vy = 0;
     g_marble.rotation = 0;
     portEXIT_CRITICAL(&g_lock);
+}
+
+/* ---- Game mode API ---- */
+
+void marble_set_position(float x, float y)
+{
+    portENTER_CRITICAL(&g_lock);
+    g_marble.x = x;
+    g_marble.y = y;
+    portEXIT_CRITICAL(&g_lock);
+}
+
+void marble_set_velocity(float vx, float vy)
+{
+    portENTER_CRITICAL(&g_lock);
+    g_marble.vx = vx;
+    g_marble.vy = vy;
+    portEXIT_CRITICAL(&g_lock);
+}
+
+float marble_get_radius(void)
+{
+    return (float)MARBLE_RADIUS_PX;
+}
+
+void marble_activate_wall_pass(int duration_ms)
+{
+    g_wall_pass_active = true;
+    g_wall_pass_timer_ms = duration_ms;
+    ESP_LOGI(TAG, "Wall-pass activated: %d ms", duration_ms);
+}
+
+bool marble_has_wall_pass(void)
+{
+    return g_wall_pass_active;
+}
+
+int marble_wall_pass_remaining_ms(void)
+{
+    return g_wall_pass_timer_ms;
+}
+
+void marble_set_bounce_mult(float mult)
+{
+    g_bounce_mult = mult;
+    if (g_bounce_mult < 0.1f) g_bounce_mult = 0.1f;
+    if (g_bounce_mult > 2.0f) g_bounce_mult = 2.0f;
+}
+
+float marble_get_bounce_mult(void)
+{
+    return g_bounce_mult;
+}
+
+void marble_physics_register_game_cb(marble_game_cb_t cb)
+{
+    g_game_cb = cb;
+}
+
+void marble_physics_unregister_game_cb(void)
+{
+    g_game_cb = NULL;
+    g_wall_pass_active = false;
+    g_wall_pass_timer_ms = 0;
+    g_bounce_mult = 1.0f;
 }
 
 /* ---- 3D金属球渲染 + 滚动纹理 + 投影 (不变) ---- */
@@ -257,8 +367,6 @@ void marble_draw(uint16_t *buf, int w, int h)
             if (diffuse < 0) diffuse = 0;
 
             /* 高光 */
-            float rx_ = 2.0f * diffuse * nx + 0.42f;
-            float ry_ = 2.0f * diffuse * ny + 0.57f;
             float rz_ = 2.0f * diffuse * nz - 0.70f;
             float spec = rz_;
             if (spec < 0) spec = 0;
@@ -291,4 +399,38 @@ void marble_draw(uint16_t *buf, int w, int h)
             buf[py * w + px] = (uint16_t)(((ir >> 3) << 11) | ((ig >> 2) << 5) | (ib >> 3));
         }
     }
+}
+
+/* ---- 1:1 scale marble render for 640x640 game buffer ---- */
+void marble_draw_game(uint16_t *buf, int w, int h)
+{
+    marble_state_t s;
+    marble_physics_get_state(&s);
+
+    const sprite_t *sp = sprite_get_marble();
+    if (!sp || !sp->pixels) return;
+
+    int sx = (int)s.x - sp->w / 2;
+    int sy = (int)s.y - sp->h / 2;
+
+    /* Shadow: darken floor under the marble */
+    int sh_y = (int)s.y + 14;
+    int sh_rx = 10, sh_ry = 4;
+    for (int sdy = -sh_ry; sdy <= sh_ry; sdy++) {
+        int spy = sh_y + sdy;
+        if (spy < 0 || spy >= h) continue;
+        float yf = (float)sdy / sh_ry;
+        int srx = (int)(sh_rx * sqrtf(1.0f - yf * yf));
+        for (int sdx = -srx; sdx <= srx; sdx++) {
+            int spx = (int)s.x + sdx;
+            if (spx < 0 || spx >= w) continue;
+            uint16_t bg = buf[spy * w + spx];
+            int ir = (bg >> 11) & 0x1F;
+            int ig = (bg >> 5)  & 0x3F;
+            int ib = bg & 0x1F;
+            buf[spy * w + spx] = (uint16_t)(((ir * 2 / 3) << 11) | ((ig * 2 / 3) << 5) | (ib * 2 / 3));
+        }
+    }
+
+    sprite_blit_keyed_edgeblend(buf, w, sp, sx, sy, 0xF81F);
 }

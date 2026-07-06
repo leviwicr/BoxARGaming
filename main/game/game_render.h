@@ -44,6 +44,18 @@ void game_render_frame(uint16_t *buf, int w, int h);
 void game_extract_contours(const camera_frame_t *frame,
                            const detection_result_t *detections, int count);
 
+/**
+ * @brief Render pixel game world to a 640×640 RGB565 buffer.
+ *
+ * Pipeline: floor background → tilemap walls → game objects (sprites) → marble.
+ * Called at ~30fps during PLAYING state. Coordinates are 1:1 (buffer = game map).
+ *
+ * @param buf  Target buffer (640×640 RGB565)
+ * @param w    Buffer width (640)
+ * @param h    Buffer height (640)
+ */
+void game_render_pixel_frame(uint16_t *buf, int w, int h);
+
 #ifdef __cplusplus
 }
 #endif

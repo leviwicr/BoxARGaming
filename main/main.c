@@ -6,6 +6,7 @@
  */
 
 #include <stdio.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -22,8 +23,23 @@
 #include "physics/marble_physics.h"
 #include "track/track_collision.h"
 #include "game/game_render.h"
+#include "pixel_game/pixel_world.h"
+#include "pixel_game/pixel_physics.h"
+#include "pixel_game/pixel_sprite.h"
 
 static const char *TAG = "main";
+
+/* ---- Pixel game state machine ---- */
+typedef enum {
+    GAME_STATE_IDLE = 0,
+    GAME_STATE_CAPTURING,
+    GAME_STATE_PLAYING,
+    GAME_STATE_WIN,
+    GAME_STATE_LOSE,
+} game_state_t;
+
+static game_state_t g_game_state = GAME_STATE_IDLE;
+static uint64_t     g_game_end_ticks = 0;
 
 void app_main(void)
 {
@@ -81,6 +97,157 @@ void app_main(void)
     uint64_t last_status_log = 0;
 
     while (1) {
+        /* ================================================================
+         * Pixel Game State Machine
+         * ================================================================ */
+        /* Check game capture trigger (Game button from IDLE) */
+        if (display_game_capture_triggered() && g_game_state == GAME_STATE_IDLE) {
+            g_game_state = GAME_STATE_CAPTURING;
+            ESP_LOGI(TAG, "Game capture triggered!");
+        }
+
+        /* Check game exit (Game/Exit button during PLAYING) */
+        if (display_game_exit_triggered()) {
+            if (g_game_state == GAME_STATE_PLAYING ||
+                g_game_state == GAME_STATE_WIN ||
+                g_game_state == GAME_STATE_LOSE) {
+                ESP_LOGI(TAG, "Game exit requested");
+                pixel_physics_stop();
+                display_exit_game_mode();
+                pixel_world_destroy();
+                g_game_state = GAME_STATE_IDLE;
+                display_set_status("Ready! Press DETECT or GAME", 0x00FF00);
+                continue;
+            }
+        }
+
+        switch (g_game_state) {
+
+        case GAME_STATE_CAPTURING: {
+            ESP_LOGI(TAG, "--- Game: Capturing frame ---");
+            display_set_status("Game: Capturing...", 0x00FF00);
+
+            camera_frame_t frame;
+            ret = camera_capture_frame(&frame, 2000);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Game capture FAILED");
+                display_set_status("Game capture FAILED!", 0xFF0000);
+                g_game_state = GAME_STATE_IDLE;
+                break;
+            }
+
+            /* Edge detection */
+            if (!edge_get_downscale_buf()) {
+                edge_detect_init();
+            }
+            uint8_t *ds_buf = edge_get_downscale_buf();
+            uint8_t *emap   = edge_get_edge_map_buf();
+            edge_downscale_half(frame.buffer, frame.width, frame.height, ds_buf);
+            edge_detect_run(ds_buf, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
+                           emap, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
+
+            /* COCO detection */
+            detection_result_t detections[DETECTION_MAX_OBJECTS];
+            int det_count = DETECTION_MAX_OBJECTS;
+            ret = detection_run(&frame, detections, &det_count, PREPROC_FLAG_NONE);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Detection failed during game capture");
+                det_count = 0;
+            }
+
+            /* Build pixel world from edges + detections */
+            sprite_init();
+            pixel_world_build(&frame, emap, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
+                            detections, det_count);
+            edge_detect_deinit();  /* release edge buffers */
+
+            /* Reset marble to map top-center */
+            marble_physics_reset();
+            marble_set_position(MARBLE_INIT_X, MARBLE_INIT_Y);
+
+            /* Init game mode display (landscape + HUD) */
+            ret = display_init_game_mode();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Game mode init FAILED");
+                pixel_world_destroy();
+                g_game_state = GAME_STATE_IDLE;
+                break;
+            }
+
+            /* Start game physics callback */
+            pixel_physics_start();
+
+            g_game_state = GAME_STATE_PLAYING;
+            ESP_LOGI(TAG, "Game PLAYING - tilt to move marble!");
+            break;
+        }
+
+        case GAME_STATE_PLAYING: {
+            /* Render pixel game world */
+            uint16_t *gbuf = (uint16_t *)display_get_game_render_buf(NULL, NULL);
+            if (gbuf) {
+                game_render_pixel_frame(gbuf, GAME_MAP_PIXELS, GAME_MAP_PIXELS);
+            }
+            display_refresh_game();
+
+            /* Update HUD */
+            marble_state_t mb;
+            marble_physics_get_state(&mb);
+            imu_attitude_t att;
+            imu_get_attitude(&att);
+            float speed = sqrtf(mb.vx * mb.vx + mb.vy * mb.vy);
+            const char *bounce_label = pixel_physics_bounce_label();
+            int wp_ms = marble_wall_pass_remaining_ms();
+
+            pixel_world_t *world = pixel_world_get();
+            display_update_game_hud(mb.x, mb.y, speed, att.roll, att.pitch,
+                                    wp_ms, bounce_label,
+                                    world ? world->objects : NULL,
+                                    world ? world->object_count : 0);
+
+            /* Check win/lose conditions */
+            if (world) {
+                if (world->goal_reached) {
+                    ESP_LOGI(TAG, "*** YOU WIN! ***");
+                    display_show_game_end(true);
+                    g_game_state = GAME_STATE_WIN;
+                    g_game_end_ticks = xTaskGetTickCount();
+                } else if (world->player_dead) {
+                    ESP_LOGI(TAG, "*** GAME OVER ***");
+                    display_show_game_end(false);
+                    g_game_state = GAME_STATE_LOSE;
+                    g_game_end_ticks = xTaskGetTickCount();
+                }
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1000 / GAME_FPS));
+            break;
+        }
+
+        case GAME_STATE_WIN:
+        case GAME_STATE_LOSE:
+            /* Show end screen for 3 seconds, then return to idle */
+            if (xTaskGetTickCount() - g_game_end_ticks > pdMS_TO_TICKS(3000)) {
+                pixel_physics_stop();
+                display_exit_game_mode();
+                pixel_world_destroy();
+                g_game_state = GAME_STATE_IDLE;
+                display_set_status("Ready! Press DETECT or GAME", 0x00FF00);
+                ESP_LOGI(TAG, "Game ended, back to IDLE");
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            break;
+
+        case GAME_STATE_IDLE:
+        default:
+            break;
+        }
+
+        /* Skip other processing when game is active */
+        if (g_game_state != GAME_STATE_IDLE) {
+            continue;
+        }
+
         /* 处理检测触发 */
         if (display_detect_triggered()) {
             ESP_LOGI(TAG, "--- Detection triggered ---");
