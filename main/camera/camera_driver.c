@@ -41,6 +41,7 @@ static void    *g_buf_addr[2]  = {NULL, NULL};
 static size_t   g_buf_len[2]   = {0};
 static int      g_num_bufs     = 0;
 static int      g_dqbuf_idx    = -1;  /* 当前已出队的缓冲区索引, -1=无 */
+static bool     g_streaming    = false;
 
 /* ========================================================================
  * 内部辅助
@@ -185,6 +186,7 @@ esp_err_t camera_init(void)
         ESP_LOGW(TAG, "ISP gamma control not supported, continuing");
     }
 
+    g_streaming = true;
     ESP_LOGI(TAG, "=== Camera Init Complete (streaming) ===");
     return ESP_OK;
 
@@ -205,6 +207,10 @@ esp_err_t camera_capture_frame(camera_frame_t *out_frame, uint32_t timeout_ms)
 {
     if (g_fd < 0) {
         ESP_LOGE(TAG, "Camera not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!g_streaming) {
+        ESP_LOGW(TAG, "Camera stream is stopped (power save)");
         return ESP_ERR_INVALID_STATE;
     }
     if (!out_frame) {
@@ -367,6 +373,7 @@ esp_err_t camera_deinit(void)
 
     if (g_fd >= 0) {
         return_buffer();
+        g_streaming = false;
 
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(g_fd, VIDIOC_STREAMOFF, &type);
@@ -383,5 +390,72 @@ esp_err_t camera_deinit(void)
     }
 
     esp_video_deinit();
+    return ESP_OK;
+}
+
+esp_err_t camera_stream_stop(void)
+{
+    if (g_fd < 0) {
+        ESP_LOGE(TAG, "Camera not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!g_streaming) {
+        return ESP_OK;  /* 已经停止 */
+    }
+
+    ESP_LOGI(TAG, "Camera stream STOP (power save)");
+
+    return_buffer();
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(g_fd, VIDIOC_STREAMOFF, &type) != 0) {
+        ESP_LOGW(TAG, "VIDIOC_STREAMOFF failed (errno=%d)", errno);
+    }
+
+    g_streaming = false;
+    return ESP_OK;
+}
+
+esp_err_t camera_stream_start(void)
+{
+    if (g_fd < 0) {
+        ESP_LOGE(TAG, "Camera not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_streaming) {
+        return ESP_OK;  /* 已在运行 */
+    }
+
+    ESP_LOGI(TAG, "Camera stream START (resume from power save)");
+
+    /* 1. 启动流 */
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(g_fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_STREAMON failed (errno=%d)", errno);
+        return ESP_FAIL;
+    }
+
+    /* 2. 将所有缓冲区重新入队 */
+    for (int i = 0; i < g_num_bufs; i++) {
+        struct v4l2_buffer buf = {0};
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        if (ioctl(g_fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGW(TAG, "QBUF[%d] failed on resume (errno=%d)", i, errno);
+        }
+    }
+    g_dqbuf_idx = -1;
+
+    g_streaming = true;
+
+    /* 3. 预热恢复 AWB/AE */
+    camera_warmup(5);
+
+    /* 4. 恢复 ISP 配置 */
+    camera_set_ae_level(CAMERA_AE_LEVEL);
+    camera_set_isp_gamma(CAMERA_ISP_GAMMA_ENABLE, CAMERA_ISP_GAMMA_VALUE);
+
+    ESP_LOGI(TAG, "Camera stream resumed");
     return ESP_OK;
 }

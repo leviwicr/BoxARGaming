@@ -9,7 +9,9 @@
       "mcp__github__get_file_contents",
       "WebFetch(domain:deepwiki.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "mcp__github__search_code"
+      "mcp__github__search_code",
+      "Read(//c/Espressif/**)",
+      "Read(//c//**)"
     ]
   }
 }

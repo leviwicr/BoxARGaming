@@ -1,12 +1,13 @@
 #include "marble_physics.h"
 #include "config.h"
-#include "imu/imu_driver.h"
+#include "ipc/ipc.h"
 #include "track/track_collision.h"
 #include "pixel_game/pixel_world.h"
 #include "pixel_game/pixel_sprite.h"
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 
 static const char *TAG = "marble";
@@ -50,17 +51,23 @@ static void physics_task(void *arg)
     const float dt = 1.0f / PHYSICS_UPDATE_HZ;
     const int period_ms = 1000 / PHYSICS_UPDATE_HZ;
 
+    imu_attitude_t cached_att = {0};
+
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(period_ms));
 
+        /* 从 IMU Task 队列读取姿态 (非阻塞, 跨核安全) */
         imu_attitude_t att;
-        if (imu_get_attitude(&att) != ESP_OK) continue;
+        if (xQueuePeek(g_imu_attitude_q, &att, 0) == pdTRUE) {
+            cached_att = att;
+        }
+        /* 队列为空时复用上次数据 (IMU 200Hz, Physics 100Hz, 理论上不会空) */
 
-        float ax = sinf(att.roll  * M_PI / 180.0f) * ACCEL_MAX;
-        float ay = sinf(att.pitch * M_PI / 180.0f) * ACCEL_MAX;
+        float ax = sinf(cached_att.roll  * M_PI / 180.0f) * ACCEL_MAX;
+        float ay = sinf(cached_att.pitch * M_PI / 180.0f) * ACCEL_MAX;
 
-        if (fabsf(att.roll)  < DEAD_ZONE_DEG) ax = 0;
-        if (fabsf(att.pitch) < DEAD_ZONE_DEG) ay = 0;
+        if (fabsf(cached_att.roll)  < DEAD_ZONE_DEG) ax = 0;
+        if (fabsf(cached_att.pitch) < DEAD_ZONE_DEG) ay = 0;
 
         portENTER_CRITICAL(&g_lock);
 
@@ -190,8 +197,8 @@ void marble_physics_init(void)
     g_marble.vx = 0;
     g_marble.vy = 0;
     g_marble.rotation = 0;
-    xTaskCreate(physics_task, "marble_phy", 4096, NULL, 5, NULL);
-    ESP_LOGI(TAG, "Physics engine started (%d Hz, track collision enabled)", PHYSICS_UPDATE_HZ);
+    xTaskCreatePinnedToCore(physics_task, "marble_phy", 4096, NULL, 3, NULL, 1);
+    ESP_LOGI(TAG, "Physics engine started on Core 1 (%d Hz, track collision enabled)", PHYSICS_UPDATE_HZ);
 }
 
 void marble_physics_get_state(marble_state_t *state)

@@ -26,6 +26,7 @@
 #include "display_driver.h"
 #include "config.h"
 #include "physics/marble_physics.h"
+#include "tasks/power_mgmt_task.h"
 
 static const char *TAG = "display";
 
@@ -200,6 +201,7 @@ static void update_preview_display(void)
 static void btn_preview_callback(lv_event_t *e)
 {
     (void)e;
+    notify_user_activity();
     g_live_view = !g_live_view;
     if (g_live_view) g_edge_view = false;
 }
@@ -207,6 +209,7 @@ static void btn_preview_callback(lv_event_t *e)
 static void btn_edge_callback(lv_event_t *e)
 {
     (void)e;
+    notify_user_activity();
     g_edge_view = !g_edge_view;
     if (g_edge_view) g_live_view = false;
 }
@@ -214,12 +217,14 @@ static void btn_edge_callback(lv_event_t *e)
 static void btn_detect_callback(lv_event_t *e)
 {
     (void)e;
+    notify_user_activity();
     g_trigger_detect = true;
 }
 
 static void btn_preproc_callback(lv_event_t *e)
 {
     (void)e;
+    notify_user_activity();
     g_preproc_idx = (g_preproc_idx + 1) % PREPROC_PRESET_COUNT;
 
     /* 更新按钮标签显示当前模式 */
@@ -231,11 +236,20 @@ static void btn_preproc_callback(lv_event_t *e)
 static void btn_game_callback(lv_event_t *e)
 {
     (void)e;
+    notify_user_activity();
     if (g_game_active) {
         g_game_exit = true;
     } else {
         g_game_capture = true;
     }
+}
+
+/* 全局触摸回调: 屏幕任意位置触摸即唤醒 (省电模式恢复) */
+static void screen_touch_callback(lv_event_t *e)
+{
+    (void)e;
+    notify_user_activity();
+    pm_resume_all();
 }
 
 /* ========================================================================
@@ -303,6 +317,9 @@ esp_err_t display_init(void)
 
     /* Save original screen */
     g_orig_scr = scr;
+
+    /* 全局触摸唤醒: 屏幕任意位置触摸 → 退出省电模式 */
+    lv_obj_add_event_cb(scr, screen_touch_callback, LV_EVENT_PRESSED, NULL);
 
     /* 标题 */
     lv_obj_t *title = lv_label_create(scr);
@@ -604,6 +621,9 @@ esp_err_t display_init_game_mode(void)
     /* Create new screen — this will be the game screen */
     lv_obj_t *game_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(game_scr, lv_color_hex(0x1A1A2E), 0);
+
+    /* 全局触摸唤醒: 游戏界面任意位置触摸 → 退出省电模式 */
+    lv_obj_add_event_cb(game_scr, screen_touch_callback, LV_EVENT_PRESSED, NULL);
 
     /* -- Top bar (full width, 30px) -- */
     g_game_top_bar = lv_obj_create(game_scr);

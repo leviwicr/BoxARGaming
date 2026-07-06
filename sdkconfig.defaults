@@ -48,3 +48,8 @@ CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y
 # OV5647: customize IPA JSON (AGC brightness fix)
 CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE=y
 CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH="main/camera/ov5647_default.json"
+
+# ============================================================
+# Power Management: SMP FreeRTOS 暂不支持 esp_pm_configure
+# 外设级省电 (背光/相机/IMU) 在 Phase 3 实现
+# ============================================================

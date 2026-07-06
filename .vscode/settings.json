@@ -14,6 +14,6 @@
     "--query-driver=**",
     "--compile-commands-dir=e:\\A-lifangli\\Project\\Phy\\code\\sample_project\\build"
   ],
-  "idf.portWin": "COM3",
+  "idf.portWin": "COM16",
   "idf.flashType": "UART"
 }

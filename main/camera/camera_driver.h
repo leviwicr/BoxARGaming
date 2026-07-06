@@ -76,6 +76,26 @@ esp_err_t camera_set_ae_level(int level);
  */
 esp_err_t camera_set_isp_gamma(bool enable, float gamma);
 
+/**
+ * @brief 停止相机流 (STREAMOFF), 保留 mmap 缓冲区
+ *
+ * 省电: 关断 CSI 控制器 + ISP, 停止传感器输出, 保留 /dev/video0 和 mmap 映射。
+ * 恢复时调用 camera_stream_start() 即可, 无需重新初始化。
+ *
+ * @return ESP_OK 成功
+ */
+esp_err_t camera_stream_stop(void);
+
+/**
+ * @brief 启动相机流 (STREAMON + QBUF + warmup)
+ *
+ * 从 camera_stream_stop() 状态恢复: 重新启动 CSI + ISP,
+ * 将所有缓冲区重新入队, 预热 5 帧以稳定 AWB/AE。
+ *
+ * @return ESP_OK 成功
+ */
+esp_err_t camera_stream_start(void);
+
 #ifdef __cplusplus
 }
 #endif
