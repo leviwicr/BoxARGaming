@@ -12,7 +12,6 @@ QueueHandle_t      g_event_q           = NULL;
 QueueHandle_t      g_frame_response_q  = NULL;
 SemaphoreHandle_t  g_capture_request   = NULL;
 QueueHandle_t      g_imu_attitude_q    = NULL;
-QueueHandle_t      g_audio_cmd_q       = NULL;
 EventGroupHandle_t g_sys_events        = NULL;
 
 /* ---- 外设省电控制标志 (Phase 3) ---- */

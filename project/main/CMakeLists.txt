@@ -32,6 +32,5 @@ idf_component_register(SRCS "main.c"
 	                                 "physics"
 	                                 "track"
 	                                 "game"
-	                                 "audio"
 	                                 "pixel_game"
 	                    REQUIRES esp_video coco_detect)

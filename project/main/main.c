@@ -112,9 +112,9 @@ void app_main(void)
     xTaskCreatePinnedToCore(imu_task, "imu", 4096, NULL, 4, NULL, 0);
 
     /* Power Management Task (prio 1 = lowest, monitors idle) */
+    xTaskCreatePinnedToCore(power_mgmt_task, "power_mgmt", 2048, NULL, 1, NULL, 0);
     /* Audio Task (prio 3 = between IMU/Display and Power, Core 0) */
     xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(power_mgmt_task, "power_mgmt", 2048, NULL, 1, NULL, 0);
 
     /* 等待 IMU 和 Display 就绪 (Camera Task 无需等待, 按需驱动) */
     EventBits_t ready = xEventGroupWaitBits(g_sys_events,
@@ -140,7 +140,7 @@ void app_main(void)
      * Core 0 保留: 相机帧捕获 (V4L2 DMA)、IMU 采样 (I2C)、
      *              LVGL 显示刷新 (SPI/DSI)、电源管理。
      * ==================================================================== */
-    xTaskCreatePinnedToCore(main_control_task, "main_ctrl", 12288, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(main_control_task, "main_ctrl", 8192, NULL, 2, NULL, 1);
     ESP_LOGI(TAG, "Main control task created on Core 1");
     ESP_LOGI(TAG, "Dual-core layout: Core0=[Camera,Display,IMU,Audio,Power] Core1=[MainCtrl,Physics]");
 }

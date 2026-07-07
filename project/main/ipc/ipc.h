@@ -36,34 +36,6 @@ typedef enum {
     EVT_USER_ACTIVITY,
 } event_type_t;
 
-/* ---- 音效类型 ---- */
-typedef enum {
-    SFX_WALL_BOUNCE,
-    SFX_FRUIT_PICKUP,
-    SFX_PORTAL,
-    SFX_DEATH,
-    SFX_WIN,
-    SFX_LOSE,
-    SFX_COUNT
-} sfx_type_t;
-
-/* ---- 音频命令类型 ---- */
-typedef enum {
-    AUDIO_CMD_PLAY_SFX,
-    AUDIO_CMD_BGM_START,
-    AUDIO_CMD_BGM_STOP,
-    AUDIO_CMD_BGM_PAUSE,
-    AUDIO_CMD_SET_MASTER_VOL,
-    AUDIO_CMD_MUTE,
-    AUDIO_CMD_UNMUTE,
-} audio_cmd_type_t;
-
-typedef struct {
-    audio_cmd_type_t cmd;
-    sfx_type_t       sfx;
-    uint8_t          value;
-} audio_cmd_t;
-
 typedef struct {
     event_type_t type;
     void        *data;
@@ -81,7 +53,6 @@ extern QueueHandle_t      g_frame_response_q;
 extern SemaphoreHandle_t  g_capture_request;
 extern QueueHandle_t      g_imu_attitude_q;
 extern EventGroupHandle_t g_sys_events;
-extern QueueHandle_t      g_audio_cmd_q;
 
 /* ---- 外设省电控制标志 (Phase 3) ---- */
 extern volatile bool g_camera_paused;   // 相机流暂停标志, 为真时 camera_capture_via_task 拒绝请求

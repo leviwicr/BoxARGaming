@@ -12,7 +12,6 @@
 #include "pixel_physics.h"
 #include "pixel_world.h"
 #include "physics/marble_physics.h"
-#include "ipc/ipc.h"
 #include "config.h"
 #include "esp_log.h"
 #include <math.h>
@@ -54,10 +53,6 @@ static void physics_callback(marble_state_t *marble, float dt)
                 marble_activate_wall_pass(GAME_WALL_PASS_MS);
                 ESP_LOGI(TAG, "Fruit picked up! Wall-pass: %d ms",
                          GAME_WALL_PASS_MS);
-                {
-                    audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_FRUIT_PICKUP };
-                    xQueueSend(g_audio_cmd_q, &cmd, 0);
-                }
             }
             break;
 
@@ -66,10 +61,6 @@ static void physics_callback(marble_state_t *marble, float dt)
             if (dist < contact_dist) {
                 world->player_dead = true;
                 ESP_LOGI(TAG, "Scissors touched! GAME OVER");
-                {
-                    audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_DEATH };
-                    xQueueSend(g_audio_cmd_q, &cmd, 0);
-                }
             }
             break;
 
@@ -78,10 +69,6 @@ static void physics_callback(marble_state_t *marble, float dt)
             if (dist < contact_dist) {
                 world->goal_reached = true;
                 ESP_LOGI(TAG, "Bottle reached! YOU WIN");
-                {
-                    audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_WIN };
-                    xQueueSend(g_audio_cmd_q, &cmd, 0);
-                }
             }
             break;
 
@@ -105,10 +92,6 @@ static void physics_callback(marble_state_t *marble, float dt)
                         obj->cooldown = 100;  /* 100 ticks @ 100Hz = 1s */
                         dst->cooldown = 100;
                         ESP_LOGI(TAG, "Portal: [%d] → [%d]!", i, partner);
-                {
-                    audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_PORTAL };
-                    xQueueSend(g_audio_cmd_q, &cmd, 0);
-                }
                     }
                 }
             }

@@ -11,7 +11,12 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "mcp__github__search_code",
       "Read(//c/Espressif/**)",
-      "Read(//c//**)"
+      "Read(//c//**)",
+      "Bash(sed -i 's/int idx_p1 = step \\\\* 2;/int idx = step * 2;/' main/audio/audio_synth.c)",
+      "Bash(sed -i '/int idx_p2 = step \\\\* 2;/d' main/audio/audio_synth.c)",
+      "Bash(sed -i '/int idx_tr = step \\\\* 2;/d' main/audio/audio_synth.c)",
+      "Bash(sed -i '/int idx_ns = step \\\\* 2;/d' main/audio/audio_synth.c)",
+      "Bash(sed -i 's/bgm_pulse1_data\\\\[idx_p1\\\\]/bgm_pulse1_data[idx]/g' main/audio/audio_synth.c)"
     ]
   }
 }

@@ -28,11 +28,6 @@ static int              g_wall_pass_timer_ms = 0;
 static float            g_bounce_mult = 1.0f;
 static marble_game_cb_t g_game_cb = NULL;
 
-/* SFX debounce: prevents continuous retriggering at 100Hz */
-static bool  g_was_on_boundary = false;      /* edge-triggered: only 1 SFX per boundary contact */
-static int   g_boundary_sfx_cooldown = 0;    /* cooldown for map boundary SFX (ticks) */
-static int   g_track_sfx_cooldown = 0;       /* cooldown for track wall bounce SFX (ticks) */
-
 /* ---- 圆周采样点 (预计算, 避免运行时 sin/cos) ---- */
 #define TRACK_SAMPLES  24
 static const float sample_cos[TRACK_SAMPLES] = {
@@ -76,10 +71,6 @@ static void physics_task(void *arg)
 
         /* 保存回调指针 — 临界区外调用, 避免在关中断时执行 ESP_LOGI/printf */
         marble_game_cb_t cb = g_game_cb;
-
-        /* Decrement SFX cooldowns */
-        if (g_boundary_sfx_cooldown > 0) g_boundary_sfx_cooldown--;
-        if (g_track_sfx_cooldown > 0) g_track_sfx_cooldown--;
 
         portENTER_CRITICAL(&g_lock);
 
@@ -148,10 +139,9 @@ static void physics_task(void *arg)
                         g_marble.vx -= (1.0f + bounce) * vn * total_nx;
                         g_marble.vy -= (1.0f + bounce) * vn * total_ny;
 
-                        if (g_track_sfx_cooldown <= 0) {
+                        {
                             audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_WALL_BOUNCE };
                             xQueueSend(g_audio_cmd_q, &cmd, 0);
-                            g_track_sfx_cooldown = 15;  /* ~150ms at 100Hz */
                         }
 
                         /* 推开: 将球沿法线推出墙壁 */
@@ -192,22 +182,19 @@ static void physics_task(void *arg)
 
         g_marble.rotation += speed * dt / MARBLE_RADIUS_PX;
 
-        /* 地图边界反弹 (后备): 仅在弹珠朝向边界运动时才反弹, 边缘触发防止连续噪音 */
+        /* 地图边界反弹 (后备) */
         float mr = MARBLE_RADIUS_PX;
-        bool on_boundary = false;
-        if (g_marble.x < mr)           { g_marble.x = mr;          if (g_marble.vx < 0) { g_marble.vx = -g_marble.vx * BOUND_BOUNCE; on_boundary = true; } else { on_boundary = true; } }
-        if (g_marble.x > MAP_SIZE - mr){ g_marble.x = MAP_SIZE - mr; if (g_marble.vx > 0) { g_marble.vx = -g_marble.vx * BOUND_BOUNCE; on_boundary = true; } else { on_boundary = true; } }
-        if (g_marble.y < mr)           { g_marble.y = mr;          if (g_marble.vy < 0) { g_marble.vy = -g_marble.vy * BOUND_BOUNCE; on_boundary = true; } else { on_boundary = true; } }
-        if (g_marble.y > MAP_SIZE - mr){ g_marble.y = MAP_SIZE - mr; if (g_marble.vy > 0) { g_marble.vy = -g_marble.vy * BOUND_BOUNCE; on_boundary = true; } else { on_boundary = true; } }
+        if (g_marble.x < mr)           { g_marble.x = mr;          g_marble.vx = -g_marble.vx * BOUND_BOUNCE; }
+        if (g_marble.x > MAP_SIZE - mr){ g_marble.x = MAP_SIZE - mr; g_marble.vx = -g_marble.vx * BOUND_BOUNCE; }
+        if (g_marble.y < mr)           { g_marble.y = mr;          g_marble.vy = -g_marble.vy * BOUND_BOUNCE; }
+        if (g_marble.y > MAP_SIZE - mr){ g_marble.y = MAP_SIZE - mr; g_marble.vy = -g_marble.vy * BOUND_BOUNCE; }
 
-        /* Edge-triggered + cooldown SFX: prevents continuous noise when
-         * ball is stuck against a boundary (e.g. during IMU startup) */
-        if (on_boundary && !g_was_on_boundary && g_boundary_sfx_cooldown <= 0) {
+        /* 地图边界反弹也触发音效 */
+        if (g_marble.x <= mr || g_marble.x >= MAP_SIZE - mr ||
+            g_marble.y <= mr || g_marble.y >= MAP_SIZE - mr) {
             audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_WALL_BOUNCE };
             xQueueSend(g_audio_cmd_q, &cmd, 0);
-            g_boundary_sfx_cooldown = 20;  /* ~200ms at 100Hz */
         }
-        g_was_on_boundary = on_boundary;
 
         portEXIT_CRITICAL(&g_lock);
 
