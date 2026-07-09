@@ -43,6 +43,7 @@ extern "C" {
 #define GLOBAL_FRICTION         0.05f   // 全局摩擦系数(大理石桌面)
 #define GOAL_THRESHOLD          20.0f   // 到达终点的判定距离(像素)
 #define MARBLE_MAX_SPEED        2000.0f // 弹珠最大速度限制(像素/s)
+#define ACCEL_LATERAL_SCALE     0.2f    // 横向(左右)加速度缩放系数
 
 /* ------------------------------ IMU配置 ------------------------------ */
 #define IMU_ENABLED             1       // 是否启用真实IMU
@@ -118,6 +119,45 @@ extern "C" {
 
 /* 精灵模式: 0=程序化生成, 1=PNG资源(后续阶段) */
 #define GAME_SPRITE_MODE        0
+
+/* ------------------------------ 游戏玩法配置 ------------------------------ */
+#define GAME_DEFAULT_LIVES      3       /* 初始生命数 */
+#define GAME_DEFAULT_TIME_SEC   60      /* 倒计时(秒) */
+#define GAME_RESPAWN_DELAY_MS   800     /* 死亡后重生延迟(ms) */
+#define GAME_CUP_AIM_MS         1000    /* 杯子捕获后瞄准时间(ms) */
+#define GAME_CUP_LAUNCH_SPEED   600     /* 杯子弹射初速度(px/s) */
+#define GAME_CUP_COOLDOWN_MS    2000    /* 杯子使用后冷却时间(ms) */
+#define GAME_SCORE_FRUIT        100     /* 拾取水果得分 */
+#define GAME_SCORE_GOAL         500     /* 到达终点得分 */
+#define GAME_SCORE_WALL_BREAK   50      /* 撞碎书墙得分 */
+#define GAME_SCORE_PORTAL       25      /* 使用传送门得分 */
+#define GAME_SCORE_TIME_BONUS   10      /* 每剩余1秒加分 */
+
+/* 难度等级 */
+typedef enum {
+    DIFF_EASY = 0,
+    DIFF_NORMAL,
+    DIFF_HARD,
+    DIFF_COUNT
+} difficulty_t;
+
+/* 难度参数 */
+#define DIFF_EASY_TIME          90
+#define DIFF_EASY_FRICTION      0.03f
+#define DIFF_EASY_LIVES         5
+
+#define DIFF_NORMAL_TIME        60
+#define DIFF_NORMAL_FRICTION    0.05f
+#define DIFF_NORMAL_LIVES       3
+
+#define DIFF_HARD_TIME          40
+#define DIFF_HARD_FRICTION      0.08f
+#define DIFF_HARD_LIVES         2
+
+/* ------------------------------ 粒子系统配置 ------------------------------ */
+#define PARTICLE_MAX_COUNT      64      /* 最大同时粒子数 */
+#define PARTICLE_GRAVITY        120.0f  /* 粒子重力 (px/s² downward) */
+#define PARTICLE_FADE_RATE      3.0f    /* 粒子透明度衰减 (0-255 per second) */
 
 #ifdef __cplusplus
 }

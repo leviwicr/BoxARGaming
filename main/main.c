@@ -127,7 +127,7 @@ void app_main(void)
         ESP_LOGW(TAG, "IMU task not ready within timeout (non-fatal)");
     }
 
-    display_set_status("Ready! Press LIVE VIEW or DETECT", 0x00FF00);
+    display_set_status("Ready!  Press Detect or Start Game", 0x58A6FF);
     ESP_LOGI(TAG, "All tasks started — entering main control loop");
 
     /* 初始化空闲计时器基线 */

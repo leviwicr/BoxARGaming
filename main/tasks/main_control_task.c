@@ -31,6 +31,7 @@
 #include "physics/marble_physics.h"
 #include "track/track_collision.h"
 #include "game/game_render.h"
+#include "game/particles.h"
 #include "pixel_game/pixel_world.h"
 #include "pixel_game/pixel_physics.h"
 #include "pixel_game/pixel_sprite.h"
@@ -50,6 +51,11 @@ typedef enum {
 
 static game_state_t g_game_state = GAME_STATE_IDLE;
 static uint64_t     g_game_end_ticks = 0;
+
+/* Per-game timer state (reset on new game) */
+static int64_t  g_play_last_time_us  = 0;
+static int64_t  g_play_last_timer_us = 0;
+static bool     g_play_timer_inited  = false;
 
 void main_control_task(void *pvParams)
 {
@@ -87,12 +93,13 @@ void main_control_task(void *pvParams)
                     audio_cmd_t cmd = { .cmd = AUDIO_CMD_BGM_STOP };
                     xQueueSend(g_audio_cmd_q, &cmd, 0);
                 }
+                particles_clear();
                 display_exit_game_mode();
                 pixel_world_destroy();
                 sprite_deinit();
                 g_game_state = GAME_STATE_IDLE;
                 xEventGroupClearBits(g_sys_events, SYS_EVT_GAME_ACTIVE);
-                display_set_status("Ready! Press DETECT or GAME", 0x00FF00);
+                display_set_status("Ready!  Press Detect or Start Game", 0x58A6FF);
                 continue;
             }
         }
@@ -131,12 +138,20 @@ void main_control_task(void *pvParams)
                 det_count = 0;
             }
 
+            /* Mask detected objects from edge map — exclude object edges */
+            edge_mask_detections(emap, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
+                                detections, det_count, 2);
+
             /* Build pixel world from edges + detections */
             sprite_deinit();   /* free previous game's sprites */
             sprite_init();
             pixel_world_build(&frame, emap, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
                             detections, det_count);
             edge_detect_deinit();
+
+            /* Apply difficulty settings */
+            pixel_world_set_difficulty(display_get_difficulty());
+            particles_clear();
 
             /* Reset marble */
             marble_physics_reset();
@@ -154,6 +169,9 @@ void main_control_task(void *pvParams)
             pixel_physics_start();
             xEventGroupSetBits(g_sys_events, SYS_EVT_GAME_ACTIVE);
 
+            /* Reset per-game timer state */
+            g_play_timer_inited = false;
+
             g_game_state = GAME_STATE_PLAYING;
             {
                 audio_cmd_t cmd = { .cmd = AUDIO_CMD_BGM_START };
@@ -164,10 +182,43 @@ void main_control_task(void *pvParams)
         }
 
         case GAME_STATE_PLAYING: {
-            /* Render pixel game world */
+            if (!g_play_timer_inited) {
+                g_play_last_time_us = esp_timer_get_time();
+                g_play_last_timer_us = g_play_last_time_us;
+                g_play_timer_inited = true;
+            }
+
+            int64_t now_us = esp_timer_get_time();
+            float frame_dt = (float)(now_us - g_play_last_time_us) / 1000000.0f;
+            if (frame_dt > 0.1f || frame_dt <= 0.0f) frame_dt = 1.0f / GAME_FPS;
+            g_play_last_time_us = now_us;
+
+            pixel_world_t *world = pixel_world_get();
+            if (now_us - g_play_last_timer_us >= 1000000 && world && !world->respawning) {
+                g_play_last_timer_us = now_us;
+                if (world->time_left_sec > 0) {
+                    world->time_left_sec--;
+                }
+                if (world->time_left_sec <= 0) {
+                    ESP_LOGI(TAG, "Time's up!");
+                    world->time_left_sec = 0;
+                    if (world->lives > 0) {
+                        pixel_world_lose_life();
+                    }
+                    if (world->lives <= 0) {
+                        world->player_dead = true;
+                    }
+                }
+            }
+
+            /* Update particles */
+            particles_update(frame_dt);
+
+            /* Render pixel game world + particles */
             uint16_t *gbuf = (uint16_t *)display_get_game_render_buf(NULL, NULL);
             if (gbuf) {
                 game_render_pixel_frame(gbuf, GAME_MAP_PIXELS, GAME_MAP_PIXELS);
+                particles_render(gbuf, GAME_MAP_PIXELS, GAME_MAP_PIXELS);
             }
             display_refresh_game();
 
@@ -180,24 +231,29 @@ void main_control_task(void *pvParams)
             const char *bounce_label = pixel_physics_bounce_label();
             int wp_ms = marble_wall_pass_remaining_ms();
 
-            pixel_world_t *world = pixel_world_get();
             display_update_game_hud(mb.x, mb.y, speed, att.roll, att.pitch,
                                     wp_ms, bounce_label,
                                     world ? world->objects : NULL,
-                                    world ? world->object_count : 0);
+                                    world ? world->object_count : 0,
+                                    world ? world->score : 0,
+                                    world ? world->lives : 0,
+                                    world ? world->time_left_sec : 0,
+                                    world ? world->difficulty : DIFF_NORMAL,
+                                    world ? world->respawning : false,
+                                    world ? world->cup_aiming : false);
 
             /* Check win/lose conditions */
             if (world) {
                 if (world->goal_reached) {
-                    ESP_LOGI(TAG, "*** YOU WIN! ***");
+                    ESP_LOGI(TAG, "*** YOU WIN! Score=%d ***", world->score);
                     {
                         audio_cmd_t cmd = { .cmd = AUDIO_CMD_BGM_STOP };
                         xQueueSend(g_audio_cmd_q, &cmd, 0);
                     }
-                    display_show_game_end(true);
+                    display_show_game_end(true, world->score);
                     g_game_state = GAME_STATE_WIN;
                     g_game_end_ticks = xTaskGetTickCount();
-                } else if (world->player_dead) {
+                } else if (world->player_dead && world->lives <= 0) {
                     ESP_LOGI(TAG, "*** GAME OVER ***");
                     {
                         audio_cmd_t cmd = { .cmd = AUDIO_CMD_BGM_STOP };
@@ -207,7 +263,7 @@ void main_control_task(void *pvParams)
                         audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_LOSE };
                         xQueueSend(g_audio_cmd_q, &cmd, 0);
                     }
-                    display_show_game_end(false);
+                    display_show_game_end(false, world->score);
                     g_game_state = GAME_STATE_LOSE;
                     g_game_end_ticks = xTaskGetTickCount();
                 }
@@ -219,22 +275,41 @@ void main_control_task(void *pvParams)
 
         case GAME_STATE_WIN:
         case GAME_STATE_LOSE:
+        {
+            /* Keep rendering so trophy zoom animation + particles play */
+            static int64_t last_win_us = 0;
+            int64_t now_win_us = esp_timer_get_time();
+            if (last_win_us == 0) last_win_us = now_win_us;
+            float pdt = (float)(now_win_us - last_win_us) / 1000000.0f;
+            if (pdt > 0.1f) pdt = 0.1f;
+            last_win_us = now_win_us;
+
+            particles_update(pdt);
+            uint16_t *gbuf = (uint16_t *)display_get_game_render_buf(NULL, NULL);
+            if (gbuf) {
+                game_render_pixel_frame(gbuf, GAME_MAP_PIXELS, GAME_MAP_PIXELS);
+                particles_render(gbuf, GAME_MAP_PIXELS, GAME_MAP_PIXELS);
+            }
+            display_refresh_game();
+
             if (xTaskGetTickCount() - g_game_end_ticks > pdMS_TO_TICKS(3000)) {
                 pixel_physics_stop();
                 {
                     audio_cmd_t cmd = { .cmd = AUDIO_CMD_BGM_STOP };
                     xQueueSend(g_audio_cmd_q, &cmd, 0);
                 }
+                particles_clear();
                 display_exit_game_mode();
                 pixel_world_destroy();
                 sprite_deinit();
                 g_game_state = GAME_STATE_IDLE;
                 xEventGroupClearBits(g_sys_events, SYS_EVT_GAME_ACTIVE);
-                display_set_status("Ready! Press DETECT or GAME", 0x00FF00);
+                display_set_status("Ready!  Press Detect or Start Game", 0x58A6FF);
                 ESP_LOGI(TAG, "Game ended, back to IDLE");
             }
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(1000 / GAME_FPS));
             break;
+        }
 
         case GAME_STATE_IDLE:
         default:
@@ -294,14 +369,8 @@ void main_control_task(void *pvParams)
             int det_count = DETECTION_MAX_OBJECTS;
             ret = detection_run(&display_frame, detections, &det_count, PREPROC_FLAG_NONE);
 
-            /* 更新预览 + 弹珠叠加 */
+            /* 更新预览 (仅检测框，无赛道/弹珠叠加) */
             display_prepare_preview(&display_frame, detections, det_count);
-            int pw, ph;
-            uint8_t *pbuf = display_get_render_buf(&pw, &ph);
-            if (pbuf && track_is_built()) {
-                track_render((uint16_t *)pbuf, pw, ph, 0xF800);
-                marble_draw((uint16_t *)pbuf, pw, ph);
-            }
             display_refresh_preview();
 
             /* 释放预处理缓冲区 */
@@ -336,123 +405,35 @@ void main_control_task(void *pvParams)
         if (display_is_edge_view()) {
             if (!was_edge_view) {
                 notify_user_activity();
-                if (track_is_built()) {
-                    ESP_LOGI(TAG, "Game mode ON");
-                    display_set_status("GAME ON  Tilt to play!", 0x00FF00);
-                } else {
-                    ESP_LOGI(TAG, "Edge view ON (setup)");
-                    display_set_status("Point camera at track & press Track",
-                                       0xFFCC00);
-                }
+                ESP_LOGI(TAG, "Edge view ON — real-time Canny");
+                display_set_status("Edge detection — real-time", 0x58A6FF);
                 was_edge_view = true;
                 was_live_view = false;
             }
 
-            /* ---- 游戏阶段: 纯画布渲染 ---- */
-            if (track_is_built()) {
-                if (display_track_capture_triggered()) {
-                    notify_user_activity();
-                    camera_frame_t frame;
-                    esp_err_t ret = camera_capture_via_task(&frame, 2000);
-                    if (ret == ESP_OK) {
-                        if (!edge_get_downscale_buf()) {
-                            edge_detect_init();
-                        }
-                        uint8_t *ds_buf = edge_get_downscale_buf();
-                        uint8_t *emap   = edge_get_edge_map_buf();
-                        edge_downscale_half(frame.buffer, frame.width,
-                                            frame.height, ds_buf);
-                        edge_detect_run(ds_buf, EDGE_DOWNSCALE_W,
-                                       EDGE_DOWNSCALE_H, emap,
-                                       CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
-
-                        track_collision_init();
-                        track_build_from_edges(emap, EDGE_DOWNSCALE_W,
-                                               EDGE_DOWNSCALE_H);
-                        edge_detect_deinit();
-
-                        {
-                            detection_result_t dets[DETECTION_MAX_OBJECTS];
-                            int dc = DETECTION_MAX_OBJECTS;
-                            if (detection_run(&frame, dets, &dc, PREPROC_FLAG_NONE) == ESP_OK && dc > 0) {
-                                game_extract_contours(&frame, dets, dc);
-                                ESP_LOGI(TAG, "Track + %d object contours", dc);
-                            } else {
-                                game_extract_contours(NULL, NULL, 0);
-                            }
-                        }
-
-                        marble_physics_reset();
-                        display_set_status("Track updated!  GAME ON", 0x00FF00);
-                        ESP_LOGI(TAG, "Track re-captured");
-                    }
-                }
-
-                int pw, ph;
-                uint8_t *pbuf = display_get_render_buf(&pw, &ph);
-                if (pbuf) {
-                    game_render_frame((uint16_t *)pbuf, pw, ph);
-                }
-                display_refresh_preview();
-                vTaskDelay(pdMS_TO_TICKS(16));
-            }
-            /* ---- 设置阶段: 相机灰度预览 ---- */
-            else {
+            /* ---- 实时边缘检测显示 ---- */
+            {
                 camera_frame_t frame;
                 esp_err_t ret = camera_capture_via_task(&frame, 2000);
                 if (ret == ESP_OK) {
-                    bool just_captured = false;
-
-                    if (display_track_capture_triggered()) {
-                        notify_user_activity();
-                        if (!edge_get_downscale_buf()) {
-                            edge_detect_init();
-                        }
-                        uint8_t *ds_buf = edge_get_downscale_buf();
-                        uint8_t *emap   = edge_get_edge_map_buf();
-                        edge_downscale_half(frame.buffer, frame.width,
-                                            frame.height, ds_buf);
-                        edge_detect_run(ds_buf, EDGE_DOWNSCALE_W,
-                                       EDGE_DOWNSCALE_H, emap,
-                                       CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
-
-                        track_collision_init();
-                        track_build_from_edges(emap, EDGE_DOWNSCALE_W,
-                                               EDGE_DOWNSCALE_H);
-                        edge_detect_deinit();
-
-                        {
-                            detection_result_t dets[DETECTION_MAX_OBJECTS];
-                            int dc = DETECTION_MAX_OBJECTS;
-                            if (detection_run(&frame, dets, &dc, PREPROC_FLAG_NONE) == ESP_OK && dc > 0) {
-                                game_extract_contours(&frame, dets, dc);
-                                ESP_LOGI(TAG, "Track + %d object contours", dc);
-                            } else {
-                                game_extract_contours(NULL, NULL, 0);
-                            }
-                        }
-
-                        marble_physics_reset();
-                        just_captured = true;
-                        ESP_LOGI(TAG, "Track captured — game on!");
+                    /* Run Canny edge detection on every frame */
+                    if (!edge_get_downscale_buf()) {
+                        edge_detect_init();
                     }
+                    uint8_t *ds_buf = edge_get_downscale_buf();
+                    uint8_t *emap   = edge_get_edge_map_buf();
+                    edge_downscale_half(frame.buffer, frame.width,
+                                        frame.height, ds_buf);
+                    edge_detect_run(ds_buf, EDGE_DOWNSCALE_W,
+                                   EDGE_DOWNSCALE_H, emap,
+                                   CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
 
-                    if (just_captured) {
-                        display_set_status("GAME ON  Tilt to play!", 0x00FF00);
-                        int pw, ph;
-                        uint8_t *pbuf = display_get_render_buf(&pw, &ph);
-                        if (pbuf) {
-                            game_render_frame((uint16_t *)pbuf, pw, ph);
-                        }
-                        display_refresh_preview();
-                    } else {
-                        display_update_edge_preview(&frame, NULL,
-                                                    EDGE_DOWNSCALE_W,
-                                                    EDGE_DOWNSCALE_H);
-                        display_refresh_preview();
-                    }
+                    /* Display grayscale preview with edge overlay */
+                    display_update_edge_preview(&frame, emap,
+                                                EDGE_DOWNSCALE_W,
+                                                EDGE_DOWNSCALE_H);
+                    display_refresh_preview();
                 } else {
-                    /* 相机暂停时避免忙等 (省电模式) */
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
             }
@@ -463,27 +444,55 @@ void main_control_task(void *pvParams)
         else if (display_is_live_view()) {
             if (!was_live_view) {
                 notify_user_activity();
-                ESP_LOGI(TAG, "Live view ON");
-                display_set_status("Live View ON  (press again to stop)", 0x00AAFF);
                 was_live_view = true;
                 was_edge_view = false;
+
+                if (!track_is_built()) {
+                    ESP_LOGI(TAG, "Live view ON — will auto-capture track");
+                    display_set_status("请拍摄画面以确定赛道", 0xFFCC00);
+                } else {
+                    ESP_LOGI(TAG, "Live view ON — game ready");
+                    display_set_status("GAME ON  Tilt to play!", 0x00FF00);
+                }
             }
 
             camera_frame_t frame;
             esp_err_t ret = camera_capture_via_task(&frame, 2000);
             if (ret == ESP_OK) {
-                display_prepare_preview(&frame, NULL, 0);
-                int pw, ph;
-                uint8_t *pbuf = display_get_render_buf(&pw, &ph);
-                if (pbuf) {
-                    if (track_is_built()) {
-                        track_render((uint16_t *)pbuf, pw, ph, 0xF800);
-                        marble_draw((uint16_t *)pbuf, pw, ph);
+                /* Auto-capture on first frame if no track yet */
+                if (!track_is_built()) {
+                    ESP_LOGI(TAG, "Auto-capturing track from Live view...");
+                    if (!edge_get_downscale_buf()) edge_detect_init();
+                    uint8_t *ds_buf = edge_get_downscale_buf();
+                    uint8_t *emap   = edge_get_edge_map_buf();
+                    edge_downscale_half(frame.buffer, frame.width, frame.height, ds_buf);
+                    edge_detect_run(ds_buf, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
+                                   emap, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD);
+
+                    {
+                        detection_result_t dets[DETECTION_MAX_OBJECTS];
+                        int dc = DETECTION_MAX_OBJECTS;
+                        if (detection_run(&frame, dets, &dc, PREPROC_FLAG_NONE) == ESP_OK && dc > 0) {
+                            edge_mask_detections(emap, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H,
+                                                dets, dc, 2);
+                            game_extract_contours(&frame, dets, dc);
+                        } else {
+                            game_extract_contours(NULL, NULL, 0);
+                        }
                     }
+
+                    track_collision_init();
+                    track_build_from_edges(emap, EDGE_DOWNSCALE_W, EDGE_DOWNSCALE_H);
+                    edge_detect_deinit();
+                    marble_physics_reset();
+                    display_set_status("GAME ON  Tilt to play!", 0x00FF00);
+                    ESP_LOGI(TAG, "Track auto-captured — game on!");
                 }
+
+                /* Always show pure camera preview (no overlays) */
+                display_prepare_preview(&frame, NULL, 0);
                 display_refresh_preview();
             } else {
-                /* 相机暂停时避免忙等 (省电模式) */
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         }

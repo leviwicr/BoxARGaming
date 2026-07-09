@@ -37,6 +37,10 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=256
 # LVGL built-in fonts (enable sizes we use)
 CONFIG_LV_FONT_MONTSERRAT_24=y
 
+# Tiny TTF: render Chinese text from embedded .ttf font file
+CONFIG_LV_USE_TINY_TTF=y
+CONFIG_LV_TINY_TTF_CACHE_GLYPH_CNT=128
+
 # LVGL v9 adapter uses ESP_MAIN_TASK_STACK_SIZE instead
 # Increase for image preprocessing + model inference stack usage
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384

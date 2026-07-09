@@ -93,6 +93,18 @@ static float coco_to_bounce(int coco_id)
 void pixel_world_init(void)
 {
     memset(&g_world, 0, sizeof(g_world));
+    g_world.difficulty = DIFF_NORMAL;
+    g_world.lives = GAME_DEFAULT_LIVES;
+    g_world.time_left_sec = GAME_DEFAULT_TIME_SEC;
+    g_world.total_time_sec = GAME_DEFAULT_TIME_SEC;
+    g_world.score = 0;
+    g_world.respawning = false;
+    g_world.respawn_timer_ms = 0;
+    g_world.cup_aiming = false;
+    g_world.cup_aim_timer_ms = 0;
+    g_world.cup_aim_angle = 0.0f;
+    g_world.cup_aim_cx = 0;
+    g_world.cup_aim_cy = 0;
     g_built = false;
 }
 
@@ -147,7 +159,15 @@ void pixel_world_build(const camera_frame_t *frame,
     track_collision_init();
     track_build_from_edges(edge_map, ew, eh);
 
-    /* ---- 3. Process detected objects ---- */
+    /* ---- 3. Add book wall tiles to collision map ---- */
+    /* Book walls are placed in the tilemap but NOT in the edge-based
+     * collision map, so the marble would pass through them. We need to
+     * mark each book tile as a solid wall in the collision bitmap. */
+    /* Books will be added in step 4 below, but we need to write their
+     * collision regions here. Since books haven't been processed yet,
+     * we defer: the collision injection happens after the for-loop below,
+     * right before we mark the world as built. */
+    /* (see end of this function for book-wall collision injection) */
     int obj_idx = 0;
     int portal_indices[10];
     int portal_count = 0;
@@ -162,6 +182,81 @@ void pixel_world_build(const camera_frame_t *frame,
     for (int i = 0; i < det_count && obj_idx < 10; i++) {
         const detection_result_t *d = &detections[i];
         int coco_id = d->category;
+
+        /* ---- Book: handled separately, converted to tile wall, not an object ---- */
+        if (coco_id == 73) {
+            int cam_cx = (d->box_camera[0] + d->box_camera[2]) / 2;
+            int cam_cy = (d->box_camera[1] + d->box_camera[3]) / 2;
+            int game_x = cam_cx - 80;
+            int game_y = cam_cy;
+            if (game_x < 0) game_x = 0;
+            if (game_x >= 640) game_x = 639;
+            if (game_y < 0) game_y = 0;
+            if (game_y >= 640) game_y = 639;
+
+            int bw = (d->box_camera[2] - d->box_camera[0]) / 16;
+            if (bw < 1) bw = 1; else if (bw > 8) bw = 8;
+            int bh = 1;  /* single row only */
+
+            int bx0 = (game_x - bw * 8) / 16;
+            int by0 = (game_y - bh * 8) / 16;
+            int bx1 = bx0 + bw;
+            int by1 = by0 + bh;
+            if (bx0 < 0) bx0 = 0;
+            if (by0 < 0) by0 = 0;
+            if (bx1 >= 40) bx1 = 39;
+            if (by1 >= 40) by1 = 39;
+
+            int book_tiles = 0;
+            for (int bty = by0; bty <= by1; bty++)
+                for (int btx = bx0; btx <= bx1; btx++)
+                    if (g_world.tilemap[bty][btx] == TILE_EMPTY) {
+                        g_world.tilemap[bty][btx] = TILE_BOOK_WALL_3;
+                        book_tiles++;
+                    }
+            ESP_LOGI(TAG, "  Book wall: %d tiles (%d,%d)-(%d,%d)",
+                     book_tiles, bx0, by0, bx1, by1);
+            continue;  /* book is a tile wall, not an interactive object */
+        }
+
+        /* ---- Spoon: converted to stone wall tiles, not an object ---- */
+        if (coco_id == 44) {
+            int cam_cx = (d->box_camera[0] + d->box_camera[2]) / 2;
+            int cam_cy = (d->box_camera[1] + d->box_camera[3]) / 2;
+            int game_x = cam_cx - 80;
+            int game_y = cam_cy;
+            if (game_x < 0) game_x = 0;
+            if (game_x >= 640) game_x = 639;
+            if (game_y < 0) game_y = 0;
+            if (game_y >= 640) game_y = 639;
+
+            int bw = (d->box_camera[2] - d->box_camera[0]) / 16;
+            int bh = (d->box_camera[3] - d->box_camera[1]) / 16;
+            if (bw < 1) bw = 1; else if (bw > 6) bw = 6;
+            if (bh < 1) bh = 1; else if (bh > 6) bh = 6;
+
+            int bx0 = (game_x - bw * 8) / 16;
+            int by0 = (game_y - bh * 8) / 16;
+            int bx1 = bx0 + bw;
+            int by1 = by0 + bh;
+            if (bx0 < 0) bx0 = 0;
+            if (by0 < 0) by0 = 0;
+            if (bx1 >= 40) bx1 = 39;
+            if (by1 >= 40) by1 = 39;
+
+            int spoon_tiles = 0;
+            for (int sty = by0; sty <= by1; sty++)
+                for (int stx = bx0; stx <= bx1; stx++)
+                    if (g_world.tilemap[sty][stx] == TILE_EMPTY) {
+                        g_world.tilemap[sty][stx] = TILE_SPOON_WALL;
+                        track_set_wall_rect(stx * 16, sty * 16,
+                                           stx * 16 + 15, sty * 16 + 15);
+                        spoon_tiles++;
+                    }
+            ESP_LOGI(TAG, "  Spoon wall: %d tiles (%d,%d)-(%d,%d)",
+                     spoon_tiles, bx0, by0, bx1, by1);
+            continue;  /* spoon is a wall, not an interactive object */
+        }
 
         gameobj_type_t gt = coco_to_game_type(coco_id);
         if (gt == GAMEOBJ_FRUIT && coco_id != 47 && coco_id != 49 && coco_id != 46)
@@ -202,38 +297,6 @@ void pixel_world_build(const camera_frame_t *frame,
         obj->cooldown   = 0;
         obj->bounce_mult = (gt == GAMEOBJ_SURFACE) ? coco_to_bounce(coco_id) : 1.0f;
 
-        /* Book: mark surrounding tiles as book wall */
-        if (coco_id == 73) {
-            int bw = (d->box_camera[2] - d->box_camera[0]) / 16;
-            int bh = (d->box_camera[3] - d->box_camera[1]) / 16;
-            if (bw < 1) bw = 1;
-            if (bw > 6) bw = 6;
-            if (bh < 1) bh = 1;
-            if (bh > 6) bh = 6;
-
-            int bx0 = (game_x - bw*8) / 16;
-            int by0 = (game_y - bh*8) / 16;
-            int bx1 = bx0 + bw;
-            int by1 = by0 + bh;
-            if (bx0 < 0) bx0 = 0;
-            if (by0 < 0) by0 = 0;
-            if (bx1 >= 40) bx1 = 39;
-            if (by1 >= 40) by1 = 39;
-
-            int book_tiles = 0;
-            for (int bty = by0; bty <= by1; bty++)
-                for (int btx = bx0; btx <= bx1; btx++)
-                    if (g_world.tilemap[bty][btx] == TILE_EMPTY) {
-                        g_world.tilemap[bty][btx] = TILE_BOOK_WALL;
-                        book_tiles++;
-                    }
-            ESP_LOGI(TAG, "  %s: book wall %d tiles (%d,%d)-(%d,%d)",
-                     coco_name(coco_id), book_tiles, bx0, by0, bx1, by1);
-            /* Book objects themselves are wall tiles, not interactive objects */
-            obj_idx--;
-            goto next_object;
-        }
-
         /* Portal: record for pairing */
         if (gt == GAMEOBJ_PORTAL) {
             portal_indices[portal_count++] = obj_idx;
@@ -242,8 +305,6 @@ void pixel_world_build(const camera_frame_t *frame,
         ESP_LOGI(TAG, "  [%d] %s type=%d at (%d,%d) r=%d",
                  obj_idx, coco_name(coco_id), gt, game_x, game_y, obj->radius);
         obj_idx++;
-
-    next_object:;
     }
 
     /* ---- 4. Pair portals ---- */
@@ -261,6 +322,27 @@ void pixel_world_build(const camera_frame_t *frame,
     }
 
     g_world.object_count = obj_idx;
+
+    /* ---- 5. Inject book wall tiles into the track collision map ---- */
+    /* Books are stored as TILE_BOOK_WALL in the tilemap but the physics
+     * collision map was built from edges alone. We must mark each book tile
+     * region as solid so the marble collides with them. */
+    int book_collision_tiles = 0;
+    for (int ty = 0; ty < 40; ty++) {
+        for (int tx = 0; tx < 40; tx++) {
+            if (tile_is_book_wall((tile_type_t)g_world.tilemap[ty][tx])) {
+                int x0 = tx * 16;
+                int y0 = ty * 16;
+                int x1 = x0 + 15;
+                int y1 = y0 + 15;
+                track_set_wall_rect(x0, y0, x1, y1);
+                book_collision_tiles++;
+            }
+        }
+    }
+    if (book_collision_tiles > 0) {
+        ESP_LOGI(TAG, "Book walls added to collision: %d tiles", book_collision_tiles);
+    }
 
     /* Reset game state */
     g_world.goal_reached = false;
@@ -301,14 +383,24 @@ tile_type_t pixel_world_get_tile(int tx, int ty)
 bool pixel_world_is_solid(int tx, int ty)
 {
     tile_type_t t = pixel_world_get_tile(tx, ty);
-    return (t == TILE_STONE_WALL || t == TILE_BOOK_WALL);
+    return (t == TILE_STONE_WALL || t == TILE_SPOON_WALL || tile_is_book_wall(t));
 }
 
 void pixel_world_destroy_tile(int tx, int ty)
 {
     if (tx < 0 || tx >= 40 || ty < 0 || ty >= 40) return;
-    if (g_world.tilemap[ty][tx] == TILE_BOOK_WALL) {
+
+    tile_type_t t = (tile_type_t)g_world.tilemap[ty][tx];
+
+    if (t == TILE_BOOK_WALL_3) {
+        g_world.tilemap[ty][tx] = TILE_BOOK_WALL_2;
+        ESP_LOGI(TAG, "Book wall hit: 2/3 left at (%d,%d)", tx, ty);
+    } else if (t == TILE_BOOK_WALL_2) {
+        g_world.tilemap[ty][tx] = TILE_BOOK_WALL_1;
+        ESP_LOGI(TAG, "Book wall hit: 1/3 left at (%d,%d)", tx, ty);
+    } else if (t == TILE_BOOK_WALL_1) {
         g_world.tilemap[ty][tx] = TILE_BROKEN;
+        track_clear_wall_rect(tx * 16, ty * 16, tx * 16 + 15, ty * 16 + 15);
         ESP_LOGI(TAG, "Book wall destroyed at (%d,%d)", tx, ty);
     }
 }
@@ -335,4 +427,112 @@ game_object_t *pixel_world_get_object_by_id(int id)
 const char *pixel_world_coco_name(int coco_id)
 {
     return coco_name(coco_id);
+}
+
+/* ========================================================================
+ * Score & Lives Management
+ * ======================================================================== */
+
+void pixel_world_add_score(int points)
+{
+    g_world.score += points;
+    if (g_world.score < 0) g_world.score = 0;
+}
+
+void pixel_world_lose_life(void)
+{
+    if (g_world.lives > 0) {
+        g_world.lives--;
+    }
+    if (g_world.lives <= 0) {
+        g_world.player_dead = true;
+    } else {
+        g_world.respawning = true;
+        g_world.respawn_timer_ms = GAME_RESPAWN_DELAY_MS;
+    }
+}
+
+bool pixel_world_is_respawning(void)
+{
+    return g_world.respawning;
+}
+
+int pixel_world_respawn_remaining_ms(void)
+{
+    return g_world.respawn_timer_ms;
+}
+
+/* ========================================================================
+ * Difficulty Management
+ * ======================================================================== */
+
+void pixel_world_set_difficulty(difficulty_t diff)
+{
+    g_world.difficulty = diff;
+    switch (diff) {
+        case DIFF_EASY:
+            g_world.lives = DIFF_EASY_LIVES;
+            g_world.time_left_sec = DIFF_EASY_TIME;
+            g_world.total_time_sec = DIFF_EASY_TIME;
+            break;
+        case DIFF_NORMAL:
+            g_world.lives = DIFF_NORMAL_LIVES;
+            g_world.time_left_sec = DIFF_NORMAL_TIME;
+            g_world.total_time_sec = DIFF_NORMAL_TIME;
+            break;
+        case DIFF_HARD:
+            g_world.lives = DIFF_HARD_LIVES;
+            g_world.time_left_sec = DIFF_HARD_TIME;
+            g_world.total_time_sec = DIFF_HARD_TIME;
+            break;
+        default: break;
+    }
+    g_world.score = 0;
+    g_world.respawning = false;
+    g_world.respawn_timer_ms = 0;
+}
+
+difficulty_t pixel_world_get_difficulty(void)
+{
+    return g_world.difficulty;
+}
+
+const char *pixel_world_difficulty_name(difficulty_t diff)
+{
+    switch (diff) {
+        case DIFF_EASY:   return "Easy";
+        case DIFF_NORMAL: return "Normal";
+        case DIFF_HARD:   return "Hard";
+        default: return "?";
+    }
+}
+
+int pixel_world_difficulty_time(difficulty_t diff)
+{
+    switch (diff) {
+        case DIFF_EASY:   return DIFF_EASY_TIME;
+        case DIFF_NORMAL: return DIFF_NORMAL_TIME;
+        case DIFF_HARD:   return DIFF_HARD_TIME;
+        default: return GAME_DEFAULT_TIME_SEC;
+    }
+}
+
+int pixel_world_difficulty_lives(difficulty_t diff)
+{
+    switch (diff) {
+        case DIFF_EASY:   return DIFF_EASY_LIVES;
+        case DIFF_NORMAL: return DIFF_NORMAL_LIVES;
+        case DIFF_HARD:   return DIFF_HARD_LIVES;
+        default: return GAME_DEFAULT_LIVES;
+    }
+}
+
+float pixel_world_difficulty_friction(difficulty_t diff)
+{
+    switch (diff) {
+        case DIFF_EASY:   return DIFF_EASY_FRICTION;
+        case DIFF_NORMAL: return DIFF_NORMAL_FRICTION;
+        case DIFF_HARD:   return DIFF_HARD_FRICTION;
+        default: return GLOBAL_FRICTION;
+    }
 }

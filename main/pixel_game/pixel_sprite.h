@@ -36,6 +36,10 @@ void sprite_blit_keyed_edgeblend(uint16_t *buf, int buf_w,
                                   const sprite_t *s, int dst_x, int dst_y,
                                   uint16_t color_key);
 
+void sprite_blit_keyed_scaled(uint16_t *buf, int buf_w,
+                               const sprite_t *s, int dst_x, int dst_y,
+                               int dst_w, int dst_h, uint16_t color_key);
+
 /* Generate all procedural sprites (call once at init) */
 void sprite_init(void);
 

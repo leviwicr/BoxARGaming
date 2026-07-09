@@ -6,6 +6,7 @@
 #include "camera/camera_driver.h"
 #include "detection/detection_driver.h"
 #include "pixel_game/pixel_world.h"
+#include "config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,17 +117,31 @@ void display_refresh_game(void);
  * @param bounce_label       Bounce coefficient label string
  * @param objects            Game objects array (NULL if none)
  * @param object_count       Number of objects
+ * @param score              Current score
+ * @param lives              Remaining lives (0 = dead)
+ * @param time_left_sec      Countdown seconds remaining
+ * @param difficulty         Current difficulty level
+ * @param respawning         True if in respawn countdown
  */
 void display_update_game_hud(float marble_x, float marble_y, float speed,
                              float tilt_x, float tilt_y,
                              int wall_pass_ms, const char *bounce_label,
-                             const game_object_t *objects, int object_count);
+                             const game_object_t *objects, int object_count,
+                             int score, int lives, int time_left_sec,
+                             difficulty_t difficulty, bool respawning,
+                             bool cup_aiming);
 
 /**
  * @brief Show game end screen (WIN or LOSE)
  * @param is_win true=you win, false=game over
+ * @param score  final score to display
  */
-void display_show_game_end(bool is_win);
+void display_show_game_end(bool is_win, int score);
+
+/**
+ * @brief Get currently selected difficulty (from main UI selector)
+ */
+difficulty_t display_get_difficulty(void);
 
 /**
  * @brief Prepare edge detection preview in render buffer (no LVGL refresh)

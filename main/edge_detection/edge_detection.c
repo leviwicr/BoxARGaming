@@ -433,3 +433,39 @@ esp_err_t edge_detect_run(const uint8_t *rgb565, int w, int h,
 
     return ESP_OK;
 }
+
+/* ========================================================================
+ * edge_mask_detections — 从边缘图中抹除检测到的物体区域
+ *
+ * 检测箱是 800×640 相机坐标, 边缘图是 400×320 (2x 下采样),
+ * 转换: emap = camera / 2。
+ * ======================================================================== */
+void edge_mask_detections(uint8_t *edge_map, int ew, int eh,
+                          const detection_result_t *detections, int det_count,
+                          int margin_px)
+{
+    if (!edge_map || !detections || det_count <= 0) return;
+
+    for (int i = 0; i < det_count; i++) {
+        const detection_result_t *d = &detections[i];
+
+        /* Camera 800×640 → Edge map 400×320 (÷2) */
+        int x1 = d->box_camera[0] / 2 - margin_px;
+        int y1 = d->box_camera[1] / 2 - margin_px;
+        int x2 = d->box_camera[2] / 2 + margin_px;
+        int y2 = d->box_camera[3] / 2 + margin_px;
+
+        /* Clamp to edge map bounds */
+        if (x1 < 0)  x1 = 0;
+        if (y1 < 0)  y1 = 0;
+        if (x2 >= ew) x2 = ew - 1;
+        if (y2 >= eh) y2 = eh - 1;
+
+        if (x2 <= x1 || y2 <= y1) continue;
+
+        /* Clear edge pixels inside the object's bounding box */
+        for (int ey = y1; ey <= y2; ey++) {
+            memset(edge_map + ey * ew + x1, 0, (size_t)(x2 - x1 + 1));
+        }
+    }
+}

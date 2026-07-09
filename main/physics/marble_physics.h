@@ -46,6 +46,10 @@ typedef void (*marble_game_cb_t)(marble_state_t *marble, float dt);
 void marble_physics_register_game_cb(marble_game_cb_t cb);
 void marble_physics_unregister_game_cb(void);
 
+/* Expose cached IMU tilt for cup aiming */
+float marble_get_tilt_roll(void);
+float marble_get_tilt_pitch(void);
+
 #ifdef __cplusplus
 }
 #endif

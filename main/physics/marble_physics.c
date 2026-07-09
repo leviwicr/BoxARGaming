@@ -4,6 +4,7 @@
 #include "track/track_collision.h"
 #include "pixel_game/pixel_world.h"
 #include "pixel_game/pixel_sprite.h"
+#include "game/particles.h"
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,11 +14,12 @@
 static const char *TAG = "marble";
 
 #define MARBLE_RADIUS_PX    8
-#define ACCEL_MAX           1200.0f
+#define ACCEL_MAX           1800.0f
 #define FRICTION_COEFF      0.50f
 #define BOUND_BOUNCE        0.35f
 #define TRACK_BOUNCE        0.55f    /* 赛道墙壁恢复系数 */
 #define DEAD_ZONE_DEG       5.0f
+#define SUBSTEP_MAX_PX      6       /* 子步长上限(px), 必须 < MARBLE_RADIUS_PX=8 */
 
 static marble_state_t g_marble;
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -27,6 +29,7 @@ static bool             g_wall_pass_active = false;
 static int              g_wall_pass_timer_ms = 0;
 static float            g_bounce_mult = 1.0f;
 static marble_game_cb_t g_game_cb = NULL;
+static imu_attitude_t   g_cached_att = {0};  /* exposed for cup aiming */
 
 /* SFX debounce: prevents continuous retriggering at 100Hz */
 static bool  g_was_on_boundary = false;      /* edge-triggered: only 1 SFX per boundary contact */
@@ -56,23 +59,21 @@ static void physics_task(void *arg)
     const float dt = 1.0f / PHYSICS_UPDATE_HZ;
     const int period_ms = 1000 / PHYSICS_UPDATE_HZ;
 
-    imu_attitude_t cached_att = {0};
-
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(period_ms));
 
         /* 从 IMU Task 队列读取姿态 (非阻塞, 跨核安全) */
         imu_attitude_t att;
         if (xQueuePeek(g_imu_attitude_q, &att, 0) == pdTRUE) {
-            cached_att = att;
+            g_cached_att = att;
         }
         /* 队列为空时复用上次数据 (IMU 200Hz, Physics 100Hz, 理论上不会空) */
 
-        float ax = sinf(cached_att.roll  * M_PI / 180.0f) * ACCEL_MAX;
-        float ay = sinf(cached_att.pitch * M_PI / 180.0f) * ACCEL_MAX;
+        float ax = sinf(g_cached_att.roll  * M_PI / 180.0f) * ACCEL_MAX * ACCEL_LATERAL_SCALE;
+        float ay = sinf(g_cached_att.pitch * M_PI / 180.0f) * ACCEL_MAX;
 
-        if (fabsf(cached_att.roll)  < DEAD_ZONE_DEG) ax = 0;
-        if (fabsf(cached_att.pitch) < DEAD_ZONE_DEG) ay = 0;
+        if (fabsf(g_cached_att.roll)  < DEAD_ZONE_DEG) ax = 0;
+        if (fabsf(g_cached_att.pitch) < DEAD_ZONE_DEG) ay = 0;
 
         /* 保存回调指针 — 临界区外调用, 避免在关中断时执行 ESP_LOGI/printf */
         marble_game_cb_t cb = g_game_cb;
@@ -99,75 +100,98 @@ static void physics_task(void *arg)
         g_marble.vx *= 1.0f - FRICTION_COEFF * dt;
         g_marble.vy *= 1.0f - FRICTION_COEFF * dt;
 
-        /* 试探新位置 */
-        float new_x = g_marble.x + g_marble.vx * dt;
-        float new_y = g_marble.y + g_marble.vy * dt;
+        /* ---- 子步长防穿墙: 每步位移不超过 SUBSTEP_MAX_PX ---- */
+        float full_dx = g_marble.vx * dt;
+        float full_dy = g_marble.vy * dt;
+        float disp = sqrtf(full_dx * full_dx + full_dy * full_dy);
+        int n_substeps = 1;
+        if (disp > SUBSTEP_MAX_PX) {
+            n_substeps = (int)(disp / SUBSTEP_MAX_PX) + 1;
+        }
+        float sub_dt = dt / (float)n_substeps;
+        bool sfx_fired_this_frame = false;
 
-        /* ---- 赛道墙壁碰撞检测 ---- */
-        if (track_is_built() && !g_wall_pass_active) {
-            float r = MARBLE_RADIUS_PX;
-            float total_nx = 0, total_ny = 0;
-            int hits = 0;
+        for (int s = 0; s < n_substeps; s++) {
+            float new_x = g_marble.x + g_marble.vx * sub_dt;
+            float new_y = g_marble.y + g_marble.vy * sub_dt;
 
-            /* 圆周采样 */
-            for (int i = 0; i < TRACK_SAMPLES; i++) {
-                int sx = (int)(new_x + sample_cos[i] * r);
-                int sy = (int)(new_y + sample_sin[i] * r);
+            /* ---- 赛道墙壁碰撞检测 ---- */
+            if (track_is_built() && !g_wall_pass_active) {
+                float r = MARBLE_RADIUS_PX;
+                float total_nx = 0, total_ny = 0;
+                int hits = 0;
+                bool hit_spoon = false;
 
-                if (track_is_wall(sx, sy)) {
+                /* 圆周采样 */
+                for (int i = 0; i < TRACK_SAMPLES; i++) {
+                    int sx = (int)(new_x + sample_cos[i] * r);
+                    int sy = (int)(new_y + sample_sin[i] * r);
+
+                    if (track_is_wall(sx, sy)) {
+                        if (pixel_world_is_built() &&
+                            pixel_world_get_tile(sx / 16, sy / 16) == TILE_SPOON_WALL) {
+                            hit_spoon = true;
+                        }
+                        float nx, ny;
+                        if (track_get_normal(sx, sy, &nx, &ny)) {
+                            total_nx += nx;
+                            total_ny += ny;
+                            hits++;
+                        }
+                    }
+                }
+
+                /* 中心点也检测 */
+                if (track_is_wall((int)new_x, (int)new_y)) {
+                    if (pixel_world_is_built() &&
+                        pixel_world_get_tile((int)new_x / 16, (int)new_y / 16) == TILE_SPOON_WALL) {
+                        hit_spoon = true;
+                    }
                     float nx, ny;
-                    if (track_get_normal(sx, sy, &nx, &ny)) {
+                    if (track_get_normal((int)new_x, (int)new_y, &nx, &ny)) {
                         total_nx += nx;
                         total_ny += ny;
                         hits++;
                     }
                 }
-            }
 
-            /* 中心点也检测 (防护: 球完全陷入墙壁) */
-            if (track_is_wall((int)new_x, (int)new_y)) {
-                float nx, ny;
-                if (track_get_normal((int)new_x, (int)new_y, &nx, &ny)) {
-                    total_nx += nx;
-                    total_ny += ny;
-                    hits++;
-                }
-            }
+                if (hits > 0) {
+                    float len = sqrtf(total_nx * total_nx + total_ny * total_ny);
+                    if (len > 0.01f) {
+                        total_nx /= len;
+                        total_ny /= len;
 
-            if (hits > 0) {
-                /* 归一化平均法线 */
-                float len = sqrtf(total_nx * total_nx + total_ny * total_ny);
-                if (len > 0.01f) {
-                    total_nx /= len;
-                    total_ny /= len;
+                        float vn = g_marble.vx * total_nx + g_marble.vy * total_ny;
+                        if (vn < 0) {
+                            /* Save pre-bounce speed & pre-push tile for book wall check */
+                            float impact_speed = sqrtf(g_marble.vx * g_marble.vx +
+                                                       g_marble.vy * g_marble.vy);
+                            int check_tx = (int)new_x / 16;
+                            int check_ty = (int)new_y / 16;
 
-                    /* 速度反射: v' = v - 2*(v·n)*n * restitution */
-                    float vn = g_marble.vx * total_nx + g_marble.vy * total_ny;
-                    if (vn < 0) {  /* 仅当朝向墙壁运动时才反弹 */
-                        float bounce = TRACK_BOUNCE * g_bounce_mult;
-                        g_marble.vx -= (1.0f + bounce) * vn * total_nx;
-                        g_marble.vy -= (1.0f + bounce) * vn * total_ny;
+                            float bounce = hit_spoon ? GAME_BOUNCE_LOW
+                                                     : (TRACK_BOUNCE * g_bounce_mult);
+                            g_marble.vx -= (1.0f + bounce) * vn * total_nx;
+                            g_marble.vy -= (1.0f + bounce) * vn * total_ny;
 
-                        if (g_track_sfx_cooldown <= 0) {
-                            audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_WALL_BOUNCE };
-                            xQueueSend(g_audio_cmd_q, &cmd, 0);
-                            g_track_sfx_cooldown = 15;  /* ~150ms at 100Hz */
-                        }
+                            if (!sfx_fired_this_frame && g_track_sfx_cooldown <= 0) {
+                                audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_WALL_BOUNCE };
+                                xQueueSend(g_audio_cmd_q, &cmd, 0);
+                                g_track_sfx_cooldown = 15;
+                                sfx_fired_this_frame = true;
+                                particles_spawn((int)new_x, (int)new_y, PARTICLE_SPARK, 4);
+                            }
 
-                        /* 推开: 将球沿法线推出墙壁 */
-                        new_x += total_nx * 6.0f;
-                        new_y += total_ny * 6.0f;
+                            new_x += total_nx * 6.0f;
+                            new_y += total_ny * 6.0f;
 
-                        /* 书墙破坏检测: 碰撞点瓦片为BOOK_WALL且速度足够 */
-                        if (pixel_world_is_built()) {
-                            float speed = sqrtf(g_marble.vx * g_marble.vx +
-                                                g_marble.vy * g_marble.vy);
-                            if (speed > GAME_BOOK_BREAK_SPEED) {
-                                int tile_x = (int)new_x / 16;
-                                int tile_y = (int)new_y / 16;
-                                tile_type_t t = pixel_world_get_tile(tile_x, tile_y);
-                                if (t == TILE_BOOK_WALL) {
-                                    pixel_world_destroy_tile(tile_x, tile_y);
+                            /* 书墙破坏检测: 使用反弹前的速度和位置 */
+                            if (pixel_world_is_built() &&
+                                impact_speed > GAME_BOOK_BREAK_SPEED) {
+                                tile_type_t t = pixel_world_get_tile(check_tx, check_ty);
+                                if (tile_is_book_wall(t)) {
+                                    pixel_world_destroy_tile(check_tx, check_ty);
+                                    pixel_world_add_score(GAME_SCORE_WALL_BREAK);
                                     g_marble.vx *= GAME_BOOK_BREAK_DAMP;
                                     g_marble.vy *= GAME_BOOK_BREAK_DAMP;
                                 }
@@ -176,11 +200,10 @@ static void physics_task(void *arg)
                     }
                 }
             }
-        }
 
-        /* 应用位置 */
-        g_marble.x = new_x;
-        g_marble.y = new_y;
+            g_marble.x = new_x;
+            g_marble.y = new_y;
+        }
 
         /* 速度限制 */
         float speed = sqrtf(g_marble.vx * g_marble.vx + g_marble.vy * g_marble.vy);
@@ -312,6 +335,16 @@ void marble_physics_unregister_game_cb(void)
     g_wall_pass_active = false;
     g_wall_pass_timer_ms = 0;
     g_bounce_mult = 1.0f;
+}
+
+float marble_get_tilt_roll(void)
+{
+    return g_cached_att.roll;
+}
+
+float marble_get_tilt_pitch(void)
+{
+    return g_cached_att.pitch;
 }
 
 /* ---- 3D金属球渲染 + 滚动纹理 + 投影 (不变) ---- */

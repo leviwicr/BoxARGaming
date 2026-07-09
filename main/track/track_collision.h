@@ -61,6 +61,27 @@ void track_render(uint16_t *buf, int buf_w, int buf_h, uint16_t wall_color);
 bool track_is_built(void);
 
 /**
+ * @brief Mark a rectangular region as wall in the collision map.
+ *
+ * Used to add book walls and other game-tilemap walls that aren't from
+ * Canny edges. Must be called after track_build_from_edges().
+ *
+ * @param x0, y0  Top-left corner in game map coords (0..639)
+ * @param x1, y1  Bottom-right corner (inclusive)
+ */
+void track_set_wall_rect(int x0, int y0, int x1, int y1);
+
+/**
+ * @brief Clear a rectangular region in the collision map (make passable).
+ *
+ * Used when a destructible book wall is destroyed.
+ *
+ * @param x0, y0  Top-left corner in game map coords (0..639)
+ * @param x1, y1  Bottom-right corner (inclusive)
+ */
+void track_clear_wall_rect(int x0, int y0, int x1, int y1);
+
+/**
  * @brief Deinitialize and free collision map
  */
 void track_collision_deinit(void);

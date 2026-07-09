@@ -108,24 +108,50 @@ static void gen_stone_wall(uint16_t *p)
 
 static void gen_book_wall(uint16_t *p)
 {
-    for (int y = 0; y < TH; y++) {
-        int spine = y / 4;
-        uint16_t base;
-        switch (spine) {
-            case 0: base = RGB(160, 100, 60); break;
-            case 1: base = RGB(140, 60, 40);  break;
-            case 2: base = RGB(180, 140, 80); break;
-            case 3: base = RGB(120, 70, 40);  break;
-            default: base = RGB(150, 100, 60); break;
-        }
-        for (int x = 0; x < TW; x++) {
-            uint16_t c = base;
-            if (x == 0 || x == 15) c = RGB(80, 50, 30);
-            if (spine == 1 && x > 4 && x < 12 && (y % 4 == 1 || y % 4 == 2))
-                c = RGB(200, 170, 50);
-            if (y % 4 == 1 && x > 2 && x < 14)
-                c = (spine == 2) ? RGB(220, 200, 140) : RGB(100, 70, 40);
-            set_px(p, TW, TH, x, y, c);
+    /* Single horizontal row of books — compact, distinct from stone wall.
+     * Dark background + tightly packed book spines in one row. */
+
+    /* Dark wood background */
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++)
+            set_px(p, TW, TH, x, y, RGB(38, 28, 18));
+
+    /* Books: one row, each book is 3px wide, 10px tall, centered vertically */
+    /* Spines arranged left to right with alternating colors */
+    uint16_t colors[] = {
+        RGB(170, 40, 30),   /* dark red    */
+        RGB(25, 75, 150),   /* blue        */
+        RGB(30, 130, 50),   /* green       */
+        RGB(160, 120, 30),  /* brown/gold  */
+        RGB(130, 40, 130),  /* purple      */
+    };
+    int n_colors = sizeof(colors) / sizeof(colors[0]);
+
+    for (int i = 0; i < 5; i++) {
+        int x0 = 1 + i * 3;
+        int bw = (i == 4) ? 2 : 3;  /* last book slightly narrower */
+        uint16_t spine = colors[i];
+
+        for (int y = 3; y < 13; y++) {
+            for (int x = x0; x < x0 + bw; x++) {
+                uint16_t c = spine;
+                /* Top highlight on spine */
+                if (y == 3) c = RGB(255, 255, 200);  /* page edge */
+                if (y == 4) {
+                    int sr = ((spine >> 11) & 0x1F) * 4 / 5;
+                    int sg = ((spine >> 5)  & 0x3F) * 4 / 5;
+                    int sb = ( spine        & 0x1F) * 4 / 5;
+                    c = (uint16_t)((sr << 11) | (sg << 5) | sb);
+                }
+                /* Right edge shadow */
+                if (x == x0 + bw - 1) {
+                    int sr = ((spine >> 11) & 0x1F) / 2;
+                    int sg = ((spine >> 5)  & 0x3F) / 2;
+                    int sb = ( spine        & 0x1F) / 2;
+                    c = (uint16_t)((sr << 11) | (sg << 5) | sb);
+                }
+                set_px(p, TW, TH, x, y, c);
+            }
         }
     }
 }
@@ -462,10 +488,13 @@ void sprite_deinit(void)
 const sprite_t *sprite_get_tile(tile_type_t type)
 {
     switch (type) {
-        case TILE_STONE_WALL: return &g_tile_stone_wall;
-        case TILE_BOOK_WALL:  return &g_tile_book_wall;
-        case TILE_BROKEN:     return &g_tile_broken;
-        default:              return NULL;
+        case TILE_STONE_WALL:
+        case TILE_SPOON_WALL:  return &g_tile_stone_wall;
+        case TILE_BOOK_WALL_3:
+        case TILE_BOOK_WALL_2:
+        case TILE_BOOK_WALL_1: return &g_tile_book_wall;
+        case TILE_BROKEN:      return &g_tile_broken;
+        default:               return NULL;
     }
 }
 
@@ -580,6 +609,28 @@ void sprite_blit_keyed_edgeblend(uint16_t *buf, int buf_w,
             } else {
                 buf[by * buf_w + bx] = p;
             }
+        }
+    }
+}
+
+void sprite_blit_keyed_scaled(uint16_t *buf, int buf_w,
+                               const sprite_t *s, int dst_x, int dst_y,
+                               int dst_w, int dst_h, uint16_t color_key)
+{
+    if (!buf || !s || !s->pixels) return;
+    int sw = s->w, sh = s->h;
+
+    for (int dy = 0; dy < dst_h; dy++) {
+        int sy = dy * sh / dst_h;
+        int by = dst_y + dy;
+        if (by < 0 || by >= 640) continue;
+        for (int dx = 0; dx < dst_w; dx++) {
+            int sx = dx * sw / dst_w;
+            uint16_t p = s->pixels[sy * sw + sx];
+            if (p == color_key) continue;
+            int bx = dst_x + dx;
+            if (bx < 0 || bx >= buf_w) continue;
+            buf[by * buf_w + bx] = p;
         }
     }
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "../detection/detection_driver.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -64,6 +65,23 @@ void edge_downscale_half(const uint8_t *src, int sw, int sh, uint8_t *dst);
 esp_err_t edge_detect_run(const uint8_t *rgb565, int w, int h,
                           uint8_t *edge_map_out,
                           int low_thresh, int high_thresh);
+
+/**
+ * @brief Mask out detected object regions from the edge map
+ *
+ * Clears edge pixels inside each detection's bounding box (with optional
+ * margin) so that object contours are excluded from the collision track.
+ *
+ * @param edge_map    Edge map buffer (w*h uint8, 0 or 255)
+ * @param ew          Edge map width (pixels)
+ * @param eh          Edge map height (pixels)
+ * @param detections  Array of detection results (camera coordinates, 800x640)
+ * @param det_count   Number of detections
+ * @param margin_px   Extra margin around each bounding box (in edge map pixels)
+ */
+void edge_mask_detections(uint8_t *edge_map, int ew, int eh,
+                          const detection_result_t *detections, int det_count,
+                          int margin_px);
 
 #ifdef __cplusplus
 }

@@ -6,17 +6,19 @@
  *   - 传送门 (配对鼠标间传送)
  *   - 死亡陷阱 (剪刀)
  *   - 终点检测 (瓶子)
- *   - 弹力表面区域 (杯/勺/键盘/手机)
+ *   - 杯子捕获 & 瞄准弹射 (倾斜设备选择方向)
+ *   - 弹力表面区域 (键盘/手机)
  */
 
 #include "pixel_physics.h"
 #include "pixel_world.h"
 #include "physics/marble_physics.h"
 #include "ipc/ipc.h"
+#include "game/particles.h"
 #include "config.h"
 #include "esp_log.h"
 #include <math.h>
-#include <stdlib.h>
+#include "esp_random.h"
 
 static const char *TAG = "pix_phys";
 
@@ -27,6 +29,47 @@ static void physics_callback(marble_state_t *marble, float dt)
 {
     pixel_world_t *world = pixel_world_get();
     if (!world || !pixel_world_is_built()) return;
+
+    /* Cup aiming: freeze marble, read tilt for direction, launch on expiry.
+     * If respawn was triggered externally (timer expiry), cancel aiming. */
+    if (world->cup_aiming) {
+        if (world->respawning) {
+            world->cup_aiming = false;
+        } else {
+            marble_set_position((float)world->cup_aim_cx, (float)world->cup_aim_cy);
+            marble_set_velocity(0, 0);
+
+            float roll  = marble_get_tilt_roll();
+            float pitch = marble_get_tilt_pitch();
+            if (fabsf(roll) > 5.0f || fabsf(pitch) > 5.0f) {
+                world->cup_aim_angle = atan2f(pitch, roll);
+            }
+
+            world->cup_aim_timer_ms -= (int)(dt * 1000.0f);
+            if (world->cup_aim_timer_ms <= 0) {
+                float a = world->cup_aim_angle;
+                float sp = (float)GAME_CUP_LAUNCH_SPEED;
+                marble_set_velocity(cosf(a) * sp, sinf(a) * sp);
+                world->cup_aiming = false;
+                ESP_LOGI(TAG, "Cup launch: angle=%.1f deg, speed=%.0f",
+                         (double)(a * 180.0f / M_PI), (double)sp);
+            }
+            return;
+        }
+    }
+
+    /* Skip interactions during respawn */
+    if (world->respawning) {
+        world->respawn_timer_ms -= (int)(dt * 1000.0f);
+        if (world->respawn_timer_ms <= 0) {
+            world->respawn_timer_ms = 0;
+            world->respawning = false;
+            marble_set_position(MARBLE_INIT_X, MARBLE_INIT_Y);
+            marble_set_velocity(0, 0);
+            ESP_LOGI(TAG, "Respawn complete, lives=%d", world->lives);
+        }
+        return;
+    }
 
     int mx = (int)marble->x;
     int my = (int)marble->y;
@@ -48,12 +91,12 @@ static void physics_callback(marble_state_t *marble, float dt)
         switch (obj->type) {
 
         case GAMEOBJ_FRUIT:
-            /* Pickup on proximity */
             if (dist < contact_dist) {
                 obj->alive = false;
                 marble_activate_wall_pass(GAME_WALL_PASS_MS);
-                ESP_LOGI(TAG, "Fruit picked up! Wall-pass: %d ms",
-                         GAME_WALL_PASS_MS);
+                pixel_world_add_score(GAME_SCORE_FRUIT);
+                particles_spawn(obj->pixel_x, obj->pixel_y, PARTICLE_FRUIT, 12);
+                ESP_LOGI(TAG, "Fruit picked up! Score=%d", world->score);
                 {
                     audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_FRUIT_PICKUP };
                     xQueueSend(g_audio_cmd_q, &cmd, 0);
@@ -62,10 +105,10 @@ static void physics_callback(marble_state_t *marble, float dt)
             break;
 
         case GAMEOBJ_DEATH:
-            /* Death on contact */
             if (dist < contact_dist) {
-                world->player_dead = true;
-                ESP_LOGI(TAG, "Scissors touched! GAME OVER");
+                particles_spawn(obj->pixel_x, obj->pixel_y, PARTICLE_DEATH, 20);
+                pixel_world_lose_life();
+                ESP_LOGI(TAG, "Death! Lives=%d", world->lives);
                 {
                     audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_DEATH };
                     xQueueSend(g_audio_cmd_q, &cmd, 0);
@@ -74,10 +117,12 @@ static void physics_callback(marble_state_t *marble, float dt)
             break;
 
         case GAMEOBJ_GOAL:
-            /* Win on contact */
             if (dist < contact_dist) {
                 world->goal_reached = true;
-                ESP_LOGI(TAG, "Bottle reached! YOU WIN");
+                pixel_world_add_score(GAME_SCORE_GOAL);
+                pixel_world_add_score(world->time_left_sec * GAME_SCORE_TIME_BONUS);
+                particles_spawn(obj->pixel_x, obj->pixel_y, PARTICLE_WIN, 30);
+                ESP_LOGI(TAG, "GOAL! Final score=%d", world->score);
                 {
                     audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_WIN };
                     xQueueSend(g_audio_cmd_q, &cmd, 0);
@@ -86,39 +131,60 @@ static void physics_callback(marble_state_t *marble, float dt)
             break;
 
         case GAMEOBJ_PORTAL:
-            /* Teleport on entering portal zone */
             if (dist < (float)obj->radius && obj->cooldown == 0) {
                 int partner = obj->partner_id;
                 if (partner >= 0 && partner < world->object_count) {
                     game_object_t *dst = &world->objects[partner];
                     if (dst->alive && dst->type == GAMEOBJ_PORTAL) {
-                        /* Teleport to paired portal */
+                        particles_spawn(obj->pixel_x, obj->pixel_y, PARTICLE_PORTAL, 8);
                         marble_set_position((float)dst->pixel_x,
                                            (float)dst->pixel_y);
-                        /* Randomize direction, preserve speed */
+                        particles_spawn(dst->pixel_x, dst->pixel_y, PARTICLE_PORTAL, 8);
+                        pixel_world_add_score(GAME_SCORE_PORTAL);
                         float speed = sqrtf(marble->vx * marble->vx +
                                            marble->vy * marble->vy);
-                        float angle = (float)(rand() % 6283) / 1000.0f;
+                        if (speed < 1.0f) speed = 200.0f;
+                        float angle = (float)(esp_random() % 6283) / 1000.0f;
                         marble_set_velocity(cosf(angle) * speed,
                                            sinf(angle) * speed);
-                        /* Both portals enter cooldown */
-                        obj->cooldown = 100;  /* 100 ticks @ 100Hz = 1s */
+                        obj->cooldown = 100;
                         dst->cooldown = 100;
-                        ESP_LOGI(TAG, "Portal: [%d] → [%d]!", i, partner);
-                {
-                    audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_PORTAL };
-                    xQueueSend(g_audio_cmd_q, &cmd, 0);
-                }
+                        ESP_LOGI(TAG, "Portal: [%d] → [%d]! Score=%d",
+                                 i, partner, world->score);
+                        {
+                            audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX, .sfx = SFX_PORTAL };
+                            xQueueSend(g_audio_cmd_q, &cmd, 0);
+                        }
                     }
                 }
             }
             break;
 
         case GAMEOBJ_SURFACE:
-            /* Surface bounce zone */
             if (dist < (float)obj->radius) {
-                marble_set_bounce_mult(obj->bounce_mult);
-                g_current_bounce = GAME_BOUNCE_DEFAULT * obj->bounce_mult;
+                /* Cup: capture & aim mechanic */
+                if (obj->coco_id == 41) {
+                    if (obj->cooldown == 0 && !world->cup_aiming) {
+                        world->cup_aiming = true;
+                        world->cup_aim_timer_ms = GAME_CUP_AIM_MS;
+                        world->cup_aim_angle = -M_PI / 2.0f;  /* default: upward */
+                        world->cup_aim_cx = obj->pixel_x;
+                        world->cup_aim_cy = obj->pixel_y;
+                        obj->cooldown = GAME_CUP_COOLDOWN_MS / 10;
+                        marble_set_position((float)obj->pixel_x, (float)obj->pixel_y);
+                        marble_set_velocity(0, 0);
+                        {
+                            audio_cmd_t cmd = { .cmd = AUDIO_CMD_PLAY_SFX,
+                                                .sfx = SFX_FRUIT_PICKUP };
+                            xQueueSend(g_audio_cmd_q, &cmd, 0);
+                        }
+                        ESP_LOGI(TAG, "Cup captured! Aiming...");
+                    }
+                } else {
+                    /* Other surfaces: bounce modifier */
+                    marble_set_bounce_mult(obj->bounce_mult);
+                    g_current_bounce = GAME_BOUNCE_DEFAULT * obj->bounce_mult;
+                }
             }
             break;
 
@@ -127,10 +193,10 @@ static void physics_callback(marble_state_t *marble, float dt)
         }
     }
 
-    /* Portal cooldown tick */
+    /* Cooldown tick (portal + cup) */
     for (int i = 0; i < world->object_count; i++) {
         game_object_t *obj = &world->objects[i];
-        if (obj->type == GAMEOBJ_PORTAL && obj->cooldown > 0) {
+        if (obj->cooldown > 0) {
             obj->cooldown--;
         }
     }

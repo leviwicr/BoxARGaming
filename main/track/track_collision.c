@@ -183,6 +183,46 @@ bool track_is_built(void)
     return g_built;
 }
 
+void track_set_wall_rect(int x0, int y0, int x1, int y1)
+{
+    if (!g_collision_map) return;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= COL_MAP_W) x1 = COL_MAP_W - 1;
+    if (y1 >= COL_MAP_H) y1 = COL_MAP_H - 1;
+    if (x0 > x1 || y0 > y1) return;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            g_collision_map[y * COL_MAP_W + x] = 1;
+        }
+    }
+
+    /* Recompute normals for the updated collision map */
+    compute_normals(g_collision_map, COL_MAP_W, COL_MAP_H);
+}
+
+void track_clear_wall_rect(int x0, int y0, int x1, int y1)
+{
+    if (!g_collision_map) return;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= COL_MAP_W) x1 = COL_MAP_W - 1;
+    if (y1 >= COL_MAP_H) y1 = COL_MAP_H - 1;
+    if (x0 > x1 || y0 > y1) return;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            g_collision_map[y * COL_MAP_W + x] = 0;
+        }
+    }
+
+    /* Recompute normals for the updated collision map */
+    compute_normals(g_collision_map, COL_MAP_W, COL_MAP_H);
+}
+
 bool track_is_wall(int game_x, int game_y)
 {
     if (!g_built || !g_collision_map) return false;

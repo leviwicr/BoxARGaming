@@ -12,10 +12,17 @@
 #include "pixel_game/pixel_sprite.h"
 #include "config.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 static const char *TAG = "game";
+
+/* Trophy zoom animation state */
+#define GOAL_ANIM_DURATION_US  1200000  /* 1.2 seconds */
+static uint64_t g_goal_anim_start_us = 0;
+static bool     g_goal_anim_started  = false;
 
 /* 桌面背景色 (深灰绿, 模拟游戏桌布) */
 #define GAME_BG_R   (uint16_t)(((30 >> 3) << 11) | ((40 >> 2) << 5) | (28 >> 3))
@@ -367,10 +374,77 @@ void game_render_frame(uint16_t *buf, int w, int h)
 }
 
 /* ========================================================================
+ * Aim arrow helpers (cup capture mechanic)
+ * ======================================================================== */
+#define AIM_ARROW_COLOR  0xFFE0   /* bright yellow */
+#define AIM_ARROW_LEN    45       /* arrow shaft length in pixels */
+#define AIM_ARROW_HEAD   10       /* arrowhead wing length */
+
+static inline void draw_pixel_safe(uint16_t *buf, int w, int h, int x, int y, uint16_t c)
+{
+    if (x >= 0 && x < w && y >= 0 && y < h) {
+        buf[y * w + x] = c;
+    }
+}
+
+static void draw_aim_arrow(uint16_t *buf, int w, int h,
+                           int cx, int cy, float angle)
+{
+    /* shaft endpoint */
+    int ex = cx + (int)(cosf(angle) * AIM_ARROW_LEN);
+    int ey = cy + (int)(sinf(angle) * AIM_ARROW_LEN);
+
+    /* Bresenham line for shaft */
+    int dx = abs(ex - cx), dy = -abs(ey - cy);
+    int sx = (cx < ex) ? 1 : -1;
+    int sy = (cy < ey) ? 1 : -1;
+    int err = dx + dy, e2;
+    int x = cx, y = cy;
+    while (1) {
+        draw_pixel_safe(buf, w, h, x, y, AIM_ARROW_COLOR);
+        if (x == ex && y == ey) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x += sx; }
+        if (e2 <= dx) { err += dx; y += sy; }
+    }
+
+    /* arrowhead wings at ±150° from shaft direction */
+    float wing_a1 = angle + 2.618f;  /* +150° */
+    float wing_a2 = angle - 2.618f;  /* -150° */
+    int w1x = ex + (int)(cosf(wing_a1) * AIM_ARROW_HEAD);
+    int w1y = ey + (int)(sinf(wing_a1) * AIM_ARROW_HEAD);
+    int w2x = ex + (int)(cosf(wing_a2) * AIM_ARROW_HEAD);
+    int w2y = ey + (int)(sinf(wing_a2) * AIM_ARROW_HEAD);
+
+    /* draw arrowhead wings */
+    dx = abs(w1x - ex); dy = -abs(w1y - ey);
+    sx = (ex < w1x) ? 1 : -1; sy = (ey < w1y) ? 1 : -1;
+    err = dx + dy; x = ex; y = ey;
+    while (1) {
+        draw_pixel_safe(buf, w, h, x, y, AIM_ARROW_COLOR);
+        if (x == w1x && y == w1y) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x += sx; }
+        if (e2 <= dx) { err += dx; y += sy; }
+    }
+
+    dx = abs(w2x - ex); dy = -abs(w2y - ey);
+    sx = (ex < w2x) ? 1 : -1; sy = (ey < w2y) ? 1 : -1;
+    err = dx + dy; x = ex; y = ey;
+    while (1) {
+        draw_pixel_safe(buf, w, h, x, y, AIM_ARROW_COLOR);
+        if (x == w2x && y == w2y) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x += sx; }
+        if (e2 <= dx) { err += dx; y += sy; }
+    }
+}
+
+/* ========================================================================
  * Pixel Game Rendering (Terraria-style)
  *
  * Renders the full pixel game world to a 640x640 RGB565 buffer.
- * Pipeline: floor → tilemap → objects → marble.
+ * Pipeline: floor → tilemap → objects → aim arrow → marble.
  * ======================================================================== */
 
 /* Floor colors (Terraria-style dirt/grass) */
@@ -458,6 +532,53 @@ void game_render_pixel_frame(uint16_t *buf, int w, int h)
         }
     }
 
+    /* 3b. Draw cup aim arrow */
+    if (world && world->cup_aiming) {
+        draw_aim_arrow(buf, w, h,
+                       world->cup_aim_cx, world->cup_aim_cy,
+                       world->cup_aim_angle);
+    }
+
     /* 4. Draw marble (3D metal ball, 1:1 scale) */
     marble_draw_game(buf, w, h);
+
+    /* 5. Goal reached: animate trophy scaling up */
+    if (world && world->goal_reached) {
+        const sprite_t *bottle = sprite_get_by_coco(39);
+        if (bottle && bottle->pixels) {
+            uint64_t now = esp_timer_get_time();
+            if (!g_goal_anim_started) {
+                g_goal_anim_start_us = now;
+                g_goal_anim_started = true;
+            }
+
+            int64_t elapsed = (int64_t)(now - g_goal_anim_start_us);
+            float t = (float)elapsed / (float)GOAL_ANIM_DURATION_US;
+            if (t > 1.0f) t = 1.0f;
+
+            /* Ease-out: 1 - (1-t)^2 */
+            float ease = 1.0f - (1.0f - t) * (1.0f - t);
+
+            /* Darken screen: 100% → 40% brightness */
+            int dark = (int)(255.0f - 153.0f * ease);  /* 255→102 */
+            for (int i = 0; i < GAME_MAP_PIXELS * GAME_MAP_PIXELS; i++) {
+                uint16_t p = buf[i];
+                int r = ((p >> 11) & 0x1F) * dark / 255;
+                int g = ((p >> 5)  & 0x3F) * dark / 255;
+                int b = ( p        & 0x1F) * dark / 255;
+                buf[i] = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+
+            /* Trophy scales from tiny to 160x240 */
+            int big_w = (int)(160.0f * ease);
+            int big_h = (int)(240.0f * ease);
+            if (big_w < 6) big_w = 6;
+            if (big_h < 9) big_h = 9;
+            int cx = (GAME_MAP_PIXELS - big_w) / 2;
+            int cy = (GAME_MAP_PIXELS - big_h) / 2;
+            sprite_blit_keyed_scaled(buf, w, bottle, cx, cy, big_w, big_h, 0xF81F);
+        }
+    } else {
+        g_goal_anim_started = false;
+    }
 }
